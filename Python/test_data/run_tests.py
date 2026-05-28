@@ -214,15 +214,41 @@ def validate_steps(steps):
         t = step.get("type")
         tag = f"Step {i} ({t})"
         if t == "Move syringe":
-            name = step.get("syringe", "")
-            if not name:
-                errors.append(f"{tag}: syringe empty")
-            fr = step.get("flowrate", 0)
-            if not _is_valid_number(fr) or fr <= 0:
-                errors.append(f"{tag}: bad flowrate {fr!r}")
-            vol = step.get("volume", 0)
-            if not _is_valid_number(vol) or vol <= 0:
-                errors.append(f"{tag}: bad volume {vol!r}")
+            pumps = step.get("pumps")
+            if isinstance(pumps, list) and len(pumps) > 0:
+                iter_pumps = pumps
+            else:
+                iter_pumps = [
+                    {
+                        "syringe": step.get("syringe", ""),
+                        "flowrate": step.get("flowrate", 0),
+                        "volume": step.get("volume", 0),
+                    }
+                ]
+                if step.get("enable_second_syringe"):
+                    iter_pumps.append(
+                        {
+                            "syringe": step.get("syringe_2", ""),
+                            "flowrate": step.get("flowrate_2", 0),
+                            "volume": step.get("volume_2", 0),
+                        }
+                    )
+            nonempty_names = []
+            for j, p in enumerate(iter_pumps):
+                pj = j + 1
+                name = str(p.get("syringe", "") or "").strip()
+                if not name:
+                    errors.append(f"{tag}: pump {pj} syringe empty")
+                else:
+                    nonempty_names.append(name)
+                fr = p.get("flowrate", 0)
+                if not _is_valid_number(fr) or fr <= 0:
+                    errors.append(f"{tag}: pump {pj} bad flowrate {fr!r}")
+                vol = p.get("volume", 0)
+                if not _is_valid_number(vol) or vol <= 0:
+                    errors.append(f"{tag}: pump {pj} bad volume {vol!r}")
+            if len(nonempty_names) != len(set(nonempty_names)):
+                errors.append(f"{tag}: duplicate syringe names for parallel pumps")
         elif t == "Switch valves":
             name = step.get("manifold", "")
             if not name:
@@ -263,6 +289,21 @@ check("T3 NaN seconds rejected", len(errs) == 1)
 
 errs = validate_steps([{"type": "Wait", "seconds": float("inf")}])
 check("T3 Inf seconds rejected", len(errs) == 1)
+
+errs = validate_steps([
+    {
+        "type": "Move syringe",
+        "pumps": [
+            {"syringe": "A", "flowrate": 10, "volume": 10},
+            {"syringe": "A", "flowrate": 10, "volume": 10},
+        ],
+    },
+])
+check(
+    "T3 pumps list duplicate syringe rejected",
+    len(errs) == 1 and any("duplicate" in e for e in errs),
+    f"{errs}",
+)
 
 # Edge cases
 errs = validate_steps([
@@ -310,7 +351,7 @@ check("T5 prefers add_syr for address", "add_syr" in gui_content)
 # ---- T7: Terminal review fixes (2026-04-19) ----
 print("\n=== T7: Terminal Review Fixes (2026-04-19) ===")
 
-# T7.1 bool穿透被拒绝
+# T7.1 bool-as-int leakage must be rejected
 errs = validate_steps([
     {"type": "Move syringe", "syringe": "S1", "flowrate": True, "volume": 50},
 ])

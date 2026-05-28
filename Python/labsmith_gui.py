@@ -90,6 +90,141 @@ def _device_names_from_board(board, kind: str) -> list:
 # the UI while it builds ten-thousand-row tables.
 MAX_FLOW_ITEMS = 1000
 
+# MoveParallel (hardware) supports at most this many pumps in one parallel step.
+MOVE_SYRINGE_MAX_PARALLEL_PUMPS = 4
+
+# Older saves used a standalone type; migrate on load into "Move syringe".
+LEGACY_DUAL_STEP_TYPE = "Move 2 syringes"
+
+FLOW_COMPONENTS = [
+    "Move syringe",
+    "Wait",
+    "Switch valves",
+    "Stop board",
+]
+
+
+def _default_pump_dict() -> dict:
+    return {"syringe": "", "flowrate": 100.0, "volume": 10.0}
+
+
+def sync_legacy_move_syringe_mirror(step: dict) -> None:
+    """Mirror first two pumps into legacy flat keys for backward-compatible JSON."""
+    pumps = step.get("pumps")
+    if not isinstance(pumps, list) or len(pumps) == 0:
+        step.setdefault("syringe", "")
+        step.setdefault("flowrate", 100.0)
+        step.setdefault("volume", 10.0)
+        step.setdefault("enable_second_syringe", False)
+        step.setdefault("syringe_2", "")
+        step.setdefault("flowrate_2", 100.0)
+        step.setdefault("volume_2", 10.0)
+        return
+    p0 = pumps[0]
+    step["syringe"] = str(p0.get("syringe", "") or "")
+    step["flowrate"] = float(p0.get("flowrate", 100.0))
+    step["volume"] = float(p0.get("volume", 10.0))
+    step["enable_second_syringe"] = len(pumps) > 1
+    if len(pumps) > 1:
+        p1 = pumps[1]
+        step["syringe_2"] = str(p1.get("syringe", "") or "")
+        step["flowrate_2"] = float(p1.get("flowrate", 100.0))
+        step["volume_2"] = float(p1.get("volume", 10.0))
+    else:
+        step["syringe_2"] = ""
+        step["flowrate_2"] = 100.0
+        step["volume_2"] = 10.0
+
+
+def migrate_flow_step_inplace(step: dict) -> None:
+    """Normalize Move syringe: canonical ``pumps`` list + legacy mirror fields."""
+    if not isinstance(step, dict):
+        return
+    t = step.get("type")
+    if t == LEGACY_DUAL_STEP_TYPE:
+        step["type"] = "Move syringe"
+        if "syringe_1" in step:
+            step.setdefault("syringe", step.get("syringe_1", ""))
+        step.pop("syringe_1", None)
+        if "flowrate_1" in step:
+            step.setdefault("flowrate", step.get("flowrate_1", 100.0))
+        step.pop("flowrate_1", None)
+        if "volume_1" in step:
+            step.setdefault("volume", step.get("volume_1", 10.0))
+        step.pop("volume_1", None)
+        step["enable_second_syringe"] = True
+
+    if step.get("type") != "Move syringe":
+        return
+
+    pumps_in = step.get("pumps")
+    if isinstance(pumps_in, list) and pumps_in:
+        normed = []
+        for p in pumps_in[:MOVE_SYRINGE_MAX_PARALLEL_PUMPS]:
+            if not isinstance(p, dict):
+                continue
+            try:
+                fr = float(p.get("flowrate", 100.0))
+                vol = float(p.get("volume", 10.0))
+            except (TypeError, ValueError):
+                fr, vol = 100.0, 10.0
+            normed.append(
+                {
+                    "syringe": str(p.get("syringe", "") or ""),
+                    "flowrate": fr,
+                    "volume": vol,
+                }
+            )
+        if normed:
+            step["pumps"] = normed
+            sync_legacy_move_syringe_mirror(step)
+            return
+
+    # Legacy flat fields → pumps
+    try:
+        fr0 = float(step.get("flowrate", 100.0))
+        v0 = float(step.get("volume", 10.0))
+    except (TypeError, ValueError):
+        fr0, v0 = 100.0, 10.0
+    pumps = [
+        {
+            "syringe": str(step.get("syringe", "") or ""),
+            "flowrate": fr0,
+            "volume": v0,
+        }
+    ]
+    if step.get("enable_second_syringe"):
+        try:
+            fr1 = float(step.get("flowrate_2", 100.0))
+            v1 = float(step.get("volume_2", 10.0))
+        except (TypeError, ValueError):
+            fr1, v1 = 100.0, 10.0
+        pumps.append(
+            {
+                "syringe": str(step.get("syringe_2", "") or ""),
+                "flowrate": fr1,
+                "volume": v1,
+            }
+        )
+    step["pumps"] = pumps[:MOVE_SYRINGE_MAX_PARALLEL_PUMPS]
+    sync_legacy_move_syringe_mirror(step)
+
+
+def move_syringe_step_has_loadable_payload(step: dict) -> bool:
+    """True if a Move syringe dict has either legacy or ``pumps`` payload."""
+    if step.get("type") != "Move syringe":
+        return False
+    pumps = step.get("pumps")
+    if isinstance(pumps, list) and len(pumps) > 0:
+        return all(
+            isinstance(x, dict)
+            and "syringe" in x
+            and "flowrate" in x
+            and "volume" in x
+            for x in pumps
+        )
+    return "syringe" in step and "flowrate" in step and "volume" in step
+
 
 ACCENT = QtGui.QColor(0, 168, 232)  # modern cyan
 
@@ -503,11 +638,27 @@ class FlowChartView(QtWidgets.QGraphicsView):
 
     def __init__(self, scene: QtWidgets.QGraphicsScene):
         super().__init__(scene)
+        self.setAlignment(
+            QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignTop
+        )
         self.setViewportUpdateMode(
             QtWidgets.QGraphicsView.ViewportUpdateMode.SmartViewportUpdate
         )
         self.setDragMode(QtWidgets.QGraphicsView.DragMode.RubberBandDrag)
         self.setMouseTracking(True)
+        self.setHorizontalScrollBarPolicy(
+            QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+        self.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.setResizeAnchor(
+            QtWidgets.QGraphicsView.ViewportAnchor.NoAnchor
+        )
+        policy = QtWidgets.QSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Expanding,
+        )
+        self.setSizePolicy(policy)
+        self.setMinimumSize(260, 200)
         self._connecting = False
         self._src_rect: Optional[GraphNodeItem] = None
         self._temp_path: Optional[QtWidgets.QGraphicsPathItem] = None
@@ -545,6 +696,7 @@ class FlowChartView(QtWidgets.QGraphicsView):
                     self._temp_path = QtWidgets.QGraphicsPathItem()
                     pen = QtGui.QPen(QtGui.QColor("#7dd8f0"), 2, QtCore.Qt.PenStyle.DashLine)
                     self._temp_path.setPen(pen)
+                    self._temp_path.setBrush(QtGui.QBrush(QtCore.Qt.BrushStyle.NoBrush))
                     self._temp_path.setZValue(50)
                     sc = self.scene()
                     if sc is not None:
@@ -627,12 +779,15 @@ class ArrowEdge(QtWidgets.QGraphicsPathItem):
         self._src_node = src_node
         self._dst_node = dst_node
         self._arrow_color = QtGui.QColor(220, 245, 255)
+        self._curve_path = QtGui.QPainterPath()
+        self._head_path = QtGui.QPainterPath()
         pen = QtGui.QPen(self._arrow_color)
         pen.setWidth(2)
         pen.setCapStyle(QtCore.Qt.PenCapStyle.RoundCap)
         pen.setJoinStyle(QtCore.Qt.PenJoinStyle.RoundJoin)
         self.setPen(pen)
-        self.setBrush(QtGui.QBrush(self._arrow_color))
+        # Do not fill the combined curve+head path — Qt would paint a blob between them.
+        self.setBrush(QtGui.QBrush(QtCore.Qt.BrushStyle.NoBrush))
         self.setZValue(0)
         self.setFlag(QtWidgets.QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
         self.update_positions()
@@ -640,22 +795,19 @@ class ArrowEdge(QtWidgets.QGraphicsPathItem):
     def cleanup(self) -> None:
         pass
 
-    def update_positions(self):
+    def _build_geometry(self) -> bool:
+        """Return True if curve/head paths were built."""
         op = self._src_node.get("out_port")
         ip = self._dst_node.get("in_port")
         if op is None or ip is None:
-            self.prepareGeometryChange()
-            self.setPath(QtGui.QPainterPath())
-            return
+            return False
         p1 = op.sceneBoundingRect().center()
         p2 = ip.sceneBoundingRect().center()
         dx = p2.x() - p1.x()
         dy = p2.y() - p1.y()
         dist = math.hypot(dx, dy)
         if dist < 1e-6:
-            self.prepareGeometryChange()
-            self.setPath(QtGui.QPainterPath())
-            return
+            return False
 
         off = max(40.0, min(abs(dx) * 0.35, 140.0))
         c1 = QtCore.QPointF(p1.x() + off, p1.y())
@@ -688,19 +840,52 @@ class ArrowEdge(QtWidgets.QGraphicsPathItem):
         head.lineTo(right)
         head.closeSubpath()
 
-        full_path = QtGui.QPainterPath()
-        full_path.addPath(curve)
-        full_path.addPath(head)
+        self._curve_path = curve
+        self._head_path = head
+        return True
 
+    def update_positions(self):
         self.prepareGeometryChange()
-        self.setPath(full_path)
+        self._curve_path = QtGui.QPainterPath()
+        self._head_path = QtGui.QPainterPath()
+        if not self._build_geometry():
+            self.setPath(QtGui.QPainterPath())
+            return
+        # Keep path as stroke-only curve for bounds/helpers; head is painted separately.
+        self.setPath(self._curve_path)
+
+    def boundingRect(self) -> QtCore.QRectF:
+        if self._curve_path.isEmpty() and self._head_path.isEmpty():
+            return super().boundingRect()
+        rect = self._curve_path.boundingRect()
+        if not self._head_path.isEmpty():
+            rect = rect.united(self._head_path.boundingRect())
+        pad = 2.0
+        return rect.adjusted(-pad, -pad, pad, pad)
+
+    def paint(self, painter: QtGui.QPainter, option, widget=None):
+        if self._curve_path.isEmpty():
+            return
+        painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+        pen = self.pen()
+        painter.setPen(pen)
+        painter.setBrush(QtGui.QBrush(QtCore.Qt.BrushStyle.NoBrush))
+        painter.strokePath(self._curve_path, pen)
+        if not self._head_path.isEmpty():
+            painter.setBrush(QtGui.QBrush(self._arrow_color))
+            painter.drawPath(self._head_path)
 
     def shape(self) -> QtGui.QPainterPath:
+        if self._curve_path.isEmpty():
+            return QtGui.QPainterPath()
         stroker = QtGui.QPainterPathStroker()
         stroker.setWidth(14)
         stroker.setCapStyle(QtCore.Qt.PenCapStyle.RoundCap)
         stroker.setJoinStyle(QtCore.Qt.PenJoinStyle.RoundJoin)
-        return stroker.createStroke(self.path())
+        hit = stroker.createStroke(self._curve_path)
+        if not self._head_path.isEmpty():
+            hit = hit.united(self._head_path)
+        return hit
 
     def refresh_geometry(self):
         """Update path when endpoints move (no scene item churn)."""
@@ -1306,6 +1491,182 @@ class MainWindow(QtWidgets.QMainWindow):
             line_edit.setPlaceholderText("Pick connected device or type legacy name")
         return combo
 
+    def _set_move_syringe_pump_field(
+        self,
+        step: dict,
+        pump_index: int,
+        field: str,
+        value,
+    ) -> bool:
+        """Update one pump entry in ``step['pumps']``; mirrors legacy flat keys."""
+        migrate_flow_step_inplace(step)
+        pumps = step.get("pumps") or []
+        if not (0 <= pump_index < len(pumps)):
+            return False
+        p = pumps[pump_index]
+        if field in ("flowrate", "volume"):
+            try:
+                p[field] = float(value)
+            except (TypeError, ValueError):
+                return False
+        elif field == "syringe":
+            p["syringe"] = str(value or "")
+        else:
+            return False
+        sync_legacy_move_syringe_mirror(step)
+        return True
+
+    def _after_move_syringe_sidebar_edit(self, step: dict) -> None:
+        """Refresh graph node label after a parameter change."""
+        migrate_flow_step_inplace(step)
+        self._graph_refresh_node_canvas_label(step)
+
+    def _after_move_syringe_flow_edit(self, step: dict) -> None:
+        migrate_flow_step_inplace(step)
+        try:
+            row = self.flow_steps.index(step)
+        except ValueError:
+            return
+        self._refresh_flow_row(row)
+
+    def _move_syringe_add_pump_row(self, step: dict, *, for_flow_table: bool) -> None:
+        migrate_flow_step_inplace(step)
+        pumps = step["pumps"]
+        if len(pumps) >= MOVE_SYRINGE_MAX_PARALLEL_PUMPS:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Move syringe",
+                f"At most {MOVE_SYRINGE_MAX_PARALLEL_PUMPS} pumps can run in parallel in one step.",
+            )
+            return
+        pumps.append(_default_pump_dict())
+        sync_legacy_move_syringe_mirror(step)
+        if for_flow_table:
+            self._after_move_syringe_flow_edit(step)
+            self._build_param_editor_for_step(step)
+        else:
+            self._after_move_syringe_sidebar_edit(step)
+            self._graph_build_param_sidebar_for_step(step)
+
+    def _move_syringe_remove_last_pump(self, step: dict, *, for_flow_table: bool) -> None:
+        migrate_flow_step_inplace(step)
+        pumps = step["pumps"]
+        if len(pumps) <= 1:
+            return
+        pumps.pop()
+        sync_legacy_move_syringe_mirror(step)
+        if for_flow_table:
+            self._after_move_syringe_flow_edit(step)
+            self._build_param_editor_for_step(step)
+        else:
+            self._after_move_syringe_sidebar_edit(step)
+            self._graph_build_param_sidebar_for_step(step)
+
+    def _move_syringe_pump_syringe_changed(
+        self,
+        step: dict,
+        pump_index: int,
+        text: str,
+        *,
+        flow: bool,
+    ) -> None:
+        self._set_move_syringe_pump_field(step, pump_index, "syringe", text)
+        if flow:
+            self._after_move_syringe_flow_edit(step)
+        else:
+            self._after_move_syringe_sidebar_edit(step)
+
+    def _append_move_syringe_param_rows(
+        self,
+        layout: QtWidgets.QFormLayout,
+        step: dict,
+        *,
+        for_flow_table: bool,
+    ) -> None:
+        """Move syringe: 1–N parallel pumps (N ≤ MoveParallel limit)."""
+        migrate_flow_step_inplace(step)
+        hint = QtWidgets.QLabel(
+            f"Add parallel pumps to run them together in this step (up to "
+            f"{MOVE_SYRINGE_MAX_PARALLEL_PUMPS}). Each pump can have its own flow rate and volume."
+        )
+        hint.setWordWrap(True)
+        layout.addRow(hint)
+
+        btn_row = QtWidgets.QHBoxLayout()
+        add_btn = QtWidgets.QPushButton("Add parallel pump")
+        add_btn.setToolTip(
+            f"Append another pump (max {MOVE_SYRINGE_MAX_PARALLEL_PUMPS})."
+        )
+        rem_btn = QtWidgets.QPushButton("Remove last pump")
+        rem_btn.setToolTip("Remove the last pump row (at least one pump is required).")
+        if for_flow_table:
+            add_btn.clicked.connect(lambda _=False, st=step: self._move_syringe_add_pump_row(st, for_flow_table=True))
+            rem_btn.clicked.connect(lambda _=False, st=step: self._move_syringe_remove_last_pump(st, for_flow_table=True))
+        else:
+            add_btn.clicked.connect(lambda _=False, st=step: self._move_syringe_add_pump_row(st, for_flow_table=False))
+            rem_btn.clicked.connect(lambda _=False, st=step: self._move_syringe_remove_last_pump(st, for_flow_table=False))
+        btn_row.addWidget(add_btn)
+        btn_row.addWidget(rem_btn)
+        btn_row.addStretch(1)
+        wrap = QtWidgets.QWidget()
+        wrap.setLayout(btn_row)
+        layout.addRow("Pumps:", wrap)
+
+        pumps = step["pumps"]
+        for idx, pump in enumerate(pumps):
+            layout.addRow(
+                QtWidgets.QLabel(f"— Pump {idx + 1} —"),
+                QtWidgets.QLabel(""),
+            )
+            syringe_combo = self._build_device_combo("syringe", pump.get("syringe", ""))
+            syringe_combo.currentTextChanged.connect(
+                lambda text, st=step, ii=idx, fl=for_flow_table: self._move_syringe_pump_syringe_changed(
+                    st, ii, text, flow=fl
+                )
+            )
+            flow_edit = QtWidgets.QLineEdit(str(pump.get("flowrate", 100.0)))
+            vol_edit = QtWidgets.QLineEdit(str(pump.get("volume", 10.0)))
+            if for_flow_table:
+                flow_edit.editingFinished.connect(
+                    lambda fe=flow_edit, st=step, ii=idx: self._finish_move_syringe_pump_line_edit(
+                        st, ii, "flowrate", fe.text(), flow=True
+                    )
+                )
+                vol_edit.editingFinished.connect(
+                    lambda ve=vol_edit, st=step, ii=idx: self._finish_move_syringe_pump_line_edit(
+                        st, ii, "volume", ve.text(), flow=True
+                    )
+                )
+            else:
+                flow_edit.editingFinished.connect(
+                    lambda fe=flow_edit, st=step, ii=idx: self._finish_move_syringe_pump_line_edit(
+                        st, ii, "flowrate", fe.text(), flow=False
+                    )
+                )
+                vol_edit.editingFinished.connect(
+                    lambda ve=vol_edit, st=step, ii=idx: self._finish_move_syringe_pump_line_edit(
+                        st, ii, "volume", ve.text(), flow=False
+                    )
+                )
+            layout.addRow(f"Syringe {idx + 1}:", syringe_combo)
+            layout.addRow(f"Flowrate {idx + 1} (µL/min):", flow_edit)
+            layout.addRow(f"Volume {idx + 1} (µL):", vol_edit)
+
+    def _finish_move_syringe_pump_line_edit(
+        self,
+        step: dict,
+        pump_index: int,
+        field: str,
+        text: str,
+        *,
+        flow: bool,
+    ) -> None:
+        if self._set_move_syringe_pump_field(step, pump_index, field, text.strip()):
+            if flow:
+                self._after_move_syringe_flow_edit(step)
+            else:
+                self._after_move_syringe_sidebar_edit(step)
+
     def _refresh_device_dropdowns(self) -> None:
         self._populate_device_names()
         row = self.flow_table.currentRow() if hasattr(self, "flow_table") else -1
@@ -1562,6 +1923,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _graph_fit_view(self):
         self.graph_view.resetTransform()
+        self._graph_update_scene_extent()
         br = self.graph_scene.itemsBoundingRect()
         if br.isValid() and not br.isEmpty():
             self.graph_view.fitInView(
@@ -2202,9 +2564,7 @@ class MainWindow(QtWidgets.QMainWindow):
         left_box = QtWidgets.QGroupBox("Components")
         left_layout = QtWidgets.QVBoxLayout(left_box)
         self.flow_components_list = QtWidgets.QListWidget()
-        self.flow_components_list.addItems(
-            ["Move syringe", "Wait", "Switch valves", "Stop board"]
-        )
+        self.flow_components_list.addItems(FLOW_COMPONENTS)
         if self.flow_components_list.count() > 0:
             self.flow_components_list.setCurrentRow(0)
         left_layout.addWidget(self.flow_components_list)
@@ -2290,7 +2650,7 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.information(
                 self,
                 "Add step",
-                "请在左侧列表中选择一种步骤类型（或点击列表第一项后再试）。",
+                "Select a step type in the left list (or click the first item), then try again.",
             )
             return
 
@@ -2298,10 +2658,9 @@ class MainWindow(QtWidgets.QMainWindow):
         if step_type == "Move syringe":
             step = {
                 "type": "Move syringe",
-                "syringe": "",
-                "flowrate": 100.0,
-                "volume": 10.0,
+                "pumps": [_default_pump_dict()],
             }
+            migrate_flow_step_inplace(step)
         elif step_type == "Wait":
             step = {
                 "type": "Wait",
@@ -2330,7 +2689,7 @@ class MainWindow(QtWidgets.QMainWindow):
         row = self.flow_table.currentRow()
         if row < 0 or row >= len(self.flow_steps):
             QtWidgets.QMessageBox.information(
-                self, "Remove step", "请先在表格中选中要删除的一行。"
+                self, "Remove step", "Select a row in the table first, then remove it."
             )
             return
         self.flow_table.removeRow(row)
@@ -2359,7 +2718,17 @@ class MainWindow(QtWidgets.QMainWindow):
     def _describe_step(self, step: dict) -> str:
         t = step.get("type")
         if t == "Move syringe":
-            return f"{step.get('syringe', '')}: {step.get('flowrate', '')} ul/min, {step.get('volume', '')} ul"
+            migrate_flow_step_inplace(step)
+            pumps = step.get("pumps") or []
+            parts = [
+                f"{p.get('syringe', '')}: {p.get('flowrate', '')} µL/min, "
+                f"{p.get('volume', '')} µL"
+                for p in pumps
+            ]
+            line = "  ||  ".join(parts) if parts else ""
+            if len(pumps) > 1:
+                line += " (parallel)"
+            return line
         if t == "Wait":
             return f"Wait {step.get('seconds', '')} s"
         if t == "Switch valves":
@@ -2367,6 +2736,45 @@ class MainWindow(QtWidgets.QMainWindow):
         if t == "Stop board":
             return "Stop board"
         return ""
+
+    def _graph_node_summary_text(self, node: dict, *, max_chars: int = 48) -> str:
+        """One-line label for Flow Graph rectangles (avoid long multi-pump detail)."""
+        t = node.get("type") or ""
+        if t == "Move syringe":
+            migrate_flow_step_inplace(node)
+            pumps = node.get("pumps") or []
+            n_p = len(pumps)
+            if n_p <= 1:
+                p0 = pumps[0] if pumps else {}
+                sn = str(p0.get("syringe", "") or "").strip()
+                chip = sn if sn else "—"
+                if len(chip) > 18:
+                    chip = chip[:17] + "…"
+                return f"Syringe: {chip}"
+            return f"{t} ({n_p} pumps)"
+        if t == "Wait":
+            return f"Wait {node.get('seconds', '')} s"
+        if t == "Switch valves":
+            mf = str(node.get("manifold", "") or "").strip()
+            if len(mf) > 20:
+                mf = mf[:19] + "…"
+            if mf:
+                return f"Valves · {mf}"
+            return "Switch valves"
+        if t == "Stop board":
+            return "Stop board"
+        raw = str(t)
+        out = raw if len(raw) <= max_chars else raw[: max_chars - 1] + "…"
+        return out
+
+    def _graph_update_scene_extent(self) -> None:
+        """Keep scene rect roomy so scrolling/zoom behaves with the current nodes."""
+        if not self.graph_nodes:
+            self.graph_scene.setSceneRect(QtCore.QRectF(-40, -40, 960, 520))
+            return
+        br = self.graph_scene.itemsBoundingRect()
+        if br.isValid() and not br.isEmpty():
+            self.graph_scene.setSceneRect(br.adjusted(-120, -80, 120, 80))
 
     def _clear_param_editor(self):
         while self.param_layout.count():
@@ -2388,27 +2796,12 @@ class MainWindow(QtWidgets.QMainWindow):
         t = step.get("type")
 
         if t == "Move syringe":
-            # Syringe name
-            syringe_combo = self._build_device_combo("syringe", step.get("syringe", ""))
-            syringe_combo.currentTextChanged.connect(
-                lambda text: self._update_move_step("syringe", text)
+            migrate_flow_step_inplace(step)
+            self._append_move_syringe_param_rows(
+                self.param_layout,
+                step,
+                for_flow_table=True,
             )
-
-            # Flowrate
-            flow_edit = QtWidgets.QLineEdit(str(step.get("flowrate", 100.0)))
-            flow_edit.editingFinished.connect(
-                lambda fe=flow_edit: self._update_move_step("flowrate", fe.text())
-            )
-
-            # Volume
-            vol_edit = QtWidgets.QLineEdit(str(step.get("volume", 10.0)))
-            vol_edit.editingFinished.connect(
-                lambda ve=vol_edit: self._update_move_step("volume", ve.text())
-            )
-
-            self.param_layout.addRow("Syringe name:", syringe_combo)
-            self.param_layout.addRow("Flowrate (ul/min):", flow_edit)
-            self.param_layout.addRow("Volume (ul):", vol_edit)
 
         elif t == "Wait":
             sec_edit = QtWidgets.QLineEdit(str(step.get("seconds", 1.0)))
@@ -2449,20 +2842,6 @@ class MainWindow(QtWidgets.QMainWindow):
             info = QtWidgets.QLabel("Stop board: call StopBoard() when reaching this step.")
             self.param_layout.addRow(info)
 
-    def _update_move_step(self, field: str, value):
-        row = self.flow_table.currentRow()
-        if row < 0 or row >= len(self.flow_steps):
-            return
-        step = self.flow_steps[row]
-        if field in ("flowrate", "volume"):
-            try:
-                step[field] = float(value)
-            except ValueError:
-                return
-        else:
-            step[field] = value
-        self._refresh_flow_row(row)
-
     def _update_wait_step(self, value):
         row = self.flow_table.currentRow()
         if row < 0 or row >= len(self.flow_steps):
@@ -2491,13 +2870,34 @@ class MainWindow(QtWidgets.QMainWindow):
             raise RuntimeError("Board not connected.")
         t = step.get("type")
         if t == "Move syringe":
-            name = step.get("syringe", "")
-            flow = float(step.get("flowrate", 0.0))
-            vol = float(step.get("volume", 0.0))
-            if not name:
-                raise ValueError("Syringe name is empty.")
-            resolved = self._resolve_runtime_device("syringe", name)
-            self._board.Move(resolved["name"], flow, vol)
+            migrate_flow_step_inplace(step)
+            pumps_cfg = step.get("pumps") or []
+            if not pumps_cfg:
+                raise ValueError("No pumps configured for this step.")
+            moves = []
+            for j, pump in enumerate(pumps_cfg):
+                ref = str(pump.get("syringe", "") or "").strip()
+                if not ref:
+                    raise ValueError(f"Syringe name is empty (pump {j + 1}).")
+                resolved = self._resolve_runtime_device("syringe", ref)
+                moves.append(
+                    (
+                        resolved["name"],
+                        float(pump.get("flowrate", 0.0)),
+                        float(pump.get("volume", 0.0)),
+                    )
+                )
+            if len(moves) == 1:
+                self._board.Move(moves[0][0], moves[0][1], moves[0][2])
+            else:
+                names = [m[0] for m in moves]
+                if len(names) != len(set(names)):
+                    raise ValueError(
+                        "Each parallel pump must use a different syringe "
+                        f"(got {names!r})."
+                    )
+                self._board.MoveParallel(moves)
+
         elif t == "Wait":
             sec = float(step.get("seconds", 0.0))
             if sec > 0:
@@ -2543,27 +2943,48 @@ class MainWindow(QtWidgets.QMainWindow):
         for i, item in enumerate(items, start=1):
             t = item.get("type")
             if t == "Move syringe":
-                kind, field = "syringe", "syringe"
+                migrate_flow_step_inplace(item)
+                for j, pump in enumerate(item.get("pumps") or []):
+                    ref = str(pump.get("syringe", "") or "").strip()
+                    if not ref:
+                        continue
+                    resolved = resolve_device_ref(
+                        "syringe", ref, self._connected_device_entries()
+                    )
+                    if resolved is None:
+                        continue
+                    resolved_name = str(resolved.get("name", "") or "").strip()
+                    if not resolved_name or resolved_name == ref:
+                        continue
+                    matched_via = str(resolved.get("matched_via", "") or "")
+                    if matched_via not in ("legacy_index", "addr"):
+                        continue
+                    pump["syringe"] = resolved_name
+                    updates.append(
+                        f"{label} {i} ({t}): syringe '{ref}' -> '{resolved_name}' "
+                        f"(pump {j + 1})"
+                    )
             elif t == "Switch valves":
-                kind, field = "manifold", "manifold"
+                ref = str(item.get("manifold", "") or "").strip()
+                if not ref:
+                    continue
+                resolved = resolve_device_ref(
+                    "manifold", ref, self._connected_device_entries()
+                )
+                if resolved is None:
+                    continue
+                resolved_name = str(resolved.get("name", "") or "").strip()
+                if not resolved_name or resolved_name == ref:
+                    continue
+                matched_via = str(resolved.get("matched_via", "") or "")
+                if matched_via not in ("legacy_index", "addr"):
+                    continue
+                item["manifold"] = resolved_name
+                updates.append(
+                    f"{label} {i} ({t}): manifold '{ref}' -> '{resolved_name}'"
+                )
             else:
                 continue
-            ref = str(item.get(field, "") or "").strip()
-            if not ref:
-                continue
-            resolved = resolve_device_ref(kind, ref, self._connected_device_entries())
-            if resolved is None:
-                continue
-            resolved_name = str(resolved.get("name", "") or "").strip()
-            if not resolved_name or resolved_name == ref:
-                continue
-            matched_via = str(resolved.get("matched_via", "") or "")
-            if matched_via not in ("legacy_index", "addr"):
-                continue
-            item[field] = resolved_name
-            updates.append(
-                f"{label} {i} ({t}): {kind} '{ref}' -> '{resolved_name}'"
-            )
         return updates
 
     def _validate_device_refs(self, items, label):
@@ -2574,47 +2995,97 @@ class MainWindow(QtWidgets.QMainWindow):
             t = item.get("type")
             tag = f"{label} {i} ({t})"
             if t == "Move syringe":
-                kind = "syringe"
-                field = "syringe"
+                migrate_flow_step_inplace(item)
+                pumps = item.get("pumps") or []
+                for j, pump in enumerate(pumps):
+                    field = f"pump {j + 1} syringe"
+                    kind = "syringe"
+                    ref = str(pump.get("syringe", "") or "").strip()
+                    if not ref:
+                        errors.append(f"{tag}: {field} name is empty.")
+                        continue
+                    if self._board is None:
+                        continue
+
+                    resolved = resolve_device_ref(kind, ref, self._connected_device_entries())
+                    if resolved is None:
+                        legacy_hint = ""
+                        m = LEGACY_SYRINGE_RE.match(ref)
+                        if m:
+                            n = int(m.group(1))
+                            connected_count = sum(
+                                1 for d in self._connected_device_entries()
+                                if str(d.get("type", "")).lower() == kind
+                            )
+                            legacy_hint = (
+                                f" (legacy index {n} exceeds connected {kind} count "
+                                f"{connected_count}; reselect from the dropdown)"
+                            )
+                        errors.append(
+                            f"{tag}: {kind} '{ref}' not in connected devices.{legacy_hint} "
+                            f"Candidates: {self._device_candidates_text(kind)}"
+                        )
+                        continue
+                    if resolved.get("matched_via") == "legacy_index":
+                        warnings.append(
+                            f"{tag}: {kind} '{ref}' matched by legacy_index to "
+                            f"'{resolved.get('name')}' (addr={resolved.get('addr')}); "
+                            f"reselect from the dropdown and save to remove compatibility mapping."
+                        )
+                syringe_names_non_empty = [
+                    str(p.get("syringe", "") or "").strip()
+                    for p in pumps
+                    if str(p.get("syringe", "") or "").strip()
+                ]
+                if len(syringe_names_non_empty) != len(set(syringe_names_non_empty)):
+                    errors.append(
+                        f"{tag}: parallel pumps must use different syringe names "
+                        f"(duplicate in {syringe_names_non_empty!r})."
+                    )
             elif t == "Switch valves":
-                kind = "manifold"
-                field = "manifold"
+                ref_fields = [("manifold", "manifold")]
+                for kind, field in ref_fields:
+                    ref = str(item.get(field, "") or "").strip()
+                    if not ref:
+                        errors.append(f"{tag}: {field} name is empty.")
+                        continue
+                    if self._board is None:
+                        continue
+
+                    resolved = resolve_device_ref(
+                        kind, ref, self._connected_device_entries()
+                    )
+                    if resolved is None:
+                        legacy_hint = ""
+                        legacy_re = (
+                            LEGACY_SYRINGE_RE if kind == "syringe" else LEGACY_MANIFOLD_RE
+                        )
+                        m = legacy_re.match(ref)
+                        if m:
+                            n = int(m.group(1))
+                            connected_count = sum(
+                                1 for d in self._connected_device_entries()
+                                if str(d.get("type", "")).lower() == kind
+                            )
+                            legacy_hint = (
+                                f" (legacy index {n} exceeds connected {kind} count "
+                                f"{connected_count}; reselect from the dropdown)"
+                            )
+                        errors.append(
+                            f"{tag}: {kind} '{ref}' not in connected devices.{legacy_hint} "
+                            f"Candidates: {self._device_candidates_text(kind)}"
+                        )
+                        continue
+                    if resolved.get("matched_via") == "legacy_index":
+                        warnings.append(
+                            f"{tag}: {kind} '{ref}' matched by legacy_index to "
+                            f"'{resolved.get('name')}' (addr={resolved.get('addr')}); "
+                            f"reselect from the dropdown and save to remove compatibility mapping."
+                        )
+
             else:
                 continue
 
-            ref = str(item.get(field, "") or "").strip()
-            if not ref:
-                errors.append(f"{tag}: {field} name is empty.")
-                continue
-            if self._board is None:
-                continue
-
-            resolved = resolve_device_ref(kind, ref, self._connected_device_entries())
-            if resolved is None:
-                legacy_hint = ""
-                legacy_re = LEGACY_SYRINGE_RE if kind == "syringe" else LEGACY_MANIFOLD_RE
-                m = legacy_re.match(ref)
-                if m:
-                    n = int(m.group(1))
-                    connected_count = sum(
-                        1 for d in self._connected_device_entries()
-                        if str(d.get("type", "")).lower() == kind
-                    )
-                    legacy_hint = (
-                        f" (legacy index {n} exceeds connected {kind} count "
-                        f"{connected_count}; reselect from the dropdown)"
-                    )
-                errors.append(
-                    f"{tag}: {kind} '{ref}' not in connected devices.{legacy_hint} "
-                    f"Candidates: {self._device_candidates_text(kind)}"
-                )
-                continue
-            if resolved.get("matched_via") == "legacy_index":
-                warnings.append(
-                    f"{tag}: {kind} '{ref}' matched by legacy_index to "
-                    f"'{resolved.get('name')}' (addr={resolved.get('addr')}); "
-                    f"reselect from the dropdown and save to remove compatibility mapping."
-                )
         return errors, warnings
 
     def _validate_steps_for_run(self, steps, label="Step"):
@@ -2634,12 +3105,23 @@ class MainWindow(QtWidgets.QMainWindow):
             t = step.get("type")
             tag = f"{label} {i} ({t})"
             if t == "Move syringe":
-                fr = step.get("flowrate", 0)
-                if not _is_valid_number(fr) or fr <= 0:
-                    errors.append(f"{tag}: flowrate must be > 0 (got {fr!r}).")
-                vol = step.get("volume", 0)
-                if not _is_valid_number(vol) or vol <= 0:
-                    errors.append(f"{tag}: volume must be > 0 (got {vol!r}).")
+                migrate_flow_step_inplace(step)
+                pumps_cfg = step["pumps"]
+                if not pumps_cfg:
+                    errors.append(f"{tag}: at least one pump is required.")
+                    continue
+                for j, pump in enumerate(pumps_cfg):
+                    pj = j + 1
+                    fr = pump.get("flowrate", 0)
+                    if not _is_valid_number(fr) or fr <= 0:
+                        errors.append(
+                            f"{tag}: pump {pj} flowrate must be > 0 (got {fr!r})."
+                        )
+                    vol = pump.get("volume", 0)
+                    if not _is_valid_number(vol) or vol <= 0:
+                        errors.append(
+                            f"{tag}: pump {pj} volume must be > 0 (got {vol!r})."
+                        )
             elif t == "Switch valves":
                 for vk in ("v1", "v2", "v3", "v4"):
                     v = step.get(vk, 0)
@@ -2719,20 +3201,36 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             steps = steps[:MAX_FLOW_ITEMS]
         _required = {
-            "Move syringe": ("syringe", "flowrate", "volume"),
+            LEGACY_DUAL_STEP_TYPE: (
+                "syringe_1", "flowrate_1", "volume_1",
+                "syringe_2", "flowrate_2", "volume_2",
+            ),
             "Wait": ("seconds",),
             "Switch valves": ("manifold", "v1", "v2", "v3", "v4"),
             "Stop board": (),
         }
+        _known_types = set(_required) | {"Move syringe"}
         loaded = []
         for i, s in enumerate(steps):
-            if not isinstance(s, dict) or s.get("type") not in _required:
+            if not isinstance(s, dict) or s.get("type") not in _known_types:
                 warnings.append(f"Step {i + 1}: skipped (unknown type or invalid)")
                 continue
-            missing = [k for k in _required[s["type"]] if k not in s]
+            stype = s.get("type")
+            if stype == LEGACY_DUAL_STEP_TYPE:
+                missing = [k for k in _required[LEGACY_DUAL_STEP_TYPE] if k not in s]
+            elif stype == "Move syringe":
+                if not move_syringe_step_has_loadable_payload(s):
+                    warnings.append(
+                        f"Step {i + 1}: skipped (Move syringe: invalid or empty payload)"
+                    )
+                    continue
+                missing = []
+            else:
+                missing = [k for k in _required[stype] if k not in s]
             if missing:
                 warnings.append(f"Step {i + 1}: skipped (missing fields: {', '.join(missing)})")
                 continue
+            migrate_flow_step_inplace(s)
             loaded.append(s)
         self.flow_steps.clear()
         self.flow_steps.extend(loaded)
@@ -2829,7 +3327,6 @@ class MainWindow(QtWidgets.QMainWindow):
             if str(d.get("type", "")).lower() == "manifold" and str(d.get("name", "")).strip()
         ]
         fallback = {
-            "Move syringe": ("syringe", syringes[0] if syringes else ""),
             "Switch valves": ("manifold", manifolds[0] if manifolds else ""),
         }
 
@@ -2840,6 +3337,25 @@ class MainWindow(QtWidgets.QMainWindow):
         # connected module of that kind to make quick testing easier.
         for i, step in enumerate(self.flow_steps, start=1):
             t = step.get("type")
+            if t == "Move syringe":
+                migrate_flow_step_inplace(step)
+                for j, pump in enumerate(step["pumps"]):
+                    slot_name = syringes[j] if j < len(syringes) else ""
+                    if not slot_name:
+                        continue
+                    ref = str(pump.get("syringe", "") or "").strip()
+                    resolved = (
+                        resolve_device_ref("syringe", ref, entries) if ref else None
+                    )
+                    if ref and resolved is not None:
+                        continue
+                    old = ref or "(empty)"
+                    pump["syringe"] = slot_name
+                    sync_legacy_move_syringe_mirror(step)
+                    updates.append(
+                        f"Step {i} ({t}): pump {j + 1} syringe '{old}' -> '{slot_name}'"
+                    )
+                continue
             if t not in fallback:
                 continue
             field, default_name = fallback[t]
@@ -2903,19 +3419,28 @@ class MainWindow(QtWidgets.QMainWindow):
             entries = self._connected_device_entries()
             t = step.get("type")
             if t == "Move syringe":
+                migrate_flow_step_inplace(step)
                 names = [
                     str(d.get("name", "")).strip()
                     for d in entries
                     if str(d.get("type", "")).lower() == "syringe" and str(d.get("name", "")).strip()
                 ]
                 if names:
-                    ref = str(step.get("syringe", "") or "").strip()
-                    resolved = resolve_device_ref("syringe", ref, entries) if ref else None
-                    if not ref or resolved is None:
+                    for j, pump in enumerate(step["pumps"]):
+                        slot_name = names[j] if j < len(names) else ""
+                        if not slot_name:
+                            continue
+                        ref = str(pump.get("syringe", "") or "").strip()
+                        resolved = (
+                            resolve_device_ref("syringe", ref, entries) if ref else None
+                        )
+                        if ref and resolved is not None:
+                            continue
                         old = ref or "(empty)"
-                        step["syringe"] = names[0]
+                        pump["syringe"] = slot_name
+                        sync_legacy_move_syringe_mirror(step)
                         autofilled.append(
-                            f"Step {row + 1} ({t}): syringe '{old}' -> '{names[0]}'"
+                            f"Step {row + 1} ({t}): pump {j + 1} syringe '{old}' -> '{slot_name}'"
                         )
             elif t == "Switch valves":
                 names = [
@@ -3014,9 +3539,7 @@ class MainWindow(QtWidgets.QMainWindow):
         left_box = QtWidgets.QGroupBox("Components")
         left_layout = QtWidgets.QVBoxLayout(left_box)
         self.graph_components_list = QtWidgets.QListWidget()
-        self.graph_components_list.addItems(
-            ["Move syringe", "Wait", "Switch valves", "Stop board"]
-        )
+        self.graph_components_list.addItems(FLOW_COMPONENTS)
         if self.graph_components_list.count() > 0:
             self.graph_components_list.setCurrentRow(0)
         left_layout.addWidget(self.graph_components_list)
@@ -3033,7 +3556,7 @@ class MainWindow(QtWidgets.QMainWindow):
         bar_scroll = QtWidgets.QScrollArea()
         bar_scroll.setWidgetResizable(True)
         bar_scroll.setWidget(self.graph_nodes_bar_inner)
-        bar_scroll.setMaximumHeight(140)
+        bar_scroll.setMaximumHeight(200)
         bar_scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
         bar_scroll.setHorizontalScrollBarPolicy(
             QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff
@@ -3061,8 +3584,13 @@ class MainWindow(QtWidgets.QMainWindow):
             "one start and one end; new wire replaces an old one on those ports. Run validates then executes."
         )
         tip.setStyleSheet("color: palette(mid); font-size: 11px;")
+        tip.setWordWrap(True)
+        tip.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Preferred,
+            QtWidgets.QSizePolicy.Policy.Maximum,
+        )
         center_layout.addWidget(tip)
-        center_layout.addWidget(self.graph_view)
+        center_layout.addWidget(self.graph_view, 1)
 
         # Bottom controls
         ctrl_layout = QtWidgets.QHBoxLayout()
@@ -3087,6 +3615,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "Flow Designer and Flow Graph do not share one list unless you add import/export."
         )
         right_outer = QtWidgets.QVBoxLayout(right_box)
+        right_box.setMinimumWidth(268)
         self.graph_param_sidebar_hint = QtWidgets.QLabel(
             "Select a node on the canvas to view and edit its parameters "
             "(same fields as Flow Designer → Step parameters; data is separate from the flow table)."
@@ -3096,9 +3625,22 @@ class MainWindow(QtWidgets.QMainWindow):
         self.graph_param_scroll = QtWidgets.QScrollArea()
         self.graph_param_scroll.setWidgetResizable(True)
         self.graph_param_scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
-        self.graph_param_scroll.setMinimumWidth(240)
+        self.graph_param_scroll.setMinimumWidth(280)
         self.graph_param_widget = QtWidgets.QWidget()
         self.graph_param_layout = QtWidgets.QFormLayout(self.graph_param_widget)
+        self.graph_param_layout.setRowWrapPolicy(
+            QtWidgets.QFormLayout.RowWrapPolicy.WrapLongRows
+        )
+        self.graph_param_layout.setFieldGrowthPolicy(
+            QtWidgets.QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow
+        )
+        self.graph_param_layout.setLabelAlignment(
+            QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignTop
+        )
+        self.graph_param_widget.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.MinimumExpanding,
+            QtWidgets.QSizePolicy.Policy.MinimumExpanding,
+        )
         self.graph_param_scroll.setWidget(self.graph_param_widget)
         right_outer.addWidget(self.graph_param_sidebar_hint)
         right_outer.addWidget(self.graph_param_scroll, 1)
@@ -3139,32 +3681,23 @@ class MainWindow(QtWidgets.QMainWindow):
         old_lbl = node.get("label_item")
         if old_lbl is not None:
             self.graph_scene.removeItem(old_lbl)
-        text = self._describe_step(node)
-        label = self.graph_scene.addSimpleText(text if text else node.get("type", ""))
+        text = self._graph_node_summary_text(node)
+        label = self.graph_scene.addSimpleText(text)
+        font = QtGui.QFont()
+        font.setPointSize(8)
+        label.setFont(font)
         label.setBrush(QtGui.QBrush(QtGui.QColor("white")))
         label.setParentItem(item)
         label.setAcceptedMouseButtons(QtCore.Qt.MouseButton.NoButton)
         label_rect = label.boundingRect()
         rect = item.rect()
         label.setPos(
-            (rect.width() - label_rect.width()) / 2,
-            (rect.height() - label_rect.height()) / 2,
+            max(2.0, (rect.width() - label_rect.width()) / 2),
+            max(2.0, (rect.height() - label_rect.height()) / 2),
         )
         node["label_item"] = label
 
-    def _graph_sidebar_update_move(self, step: dict, field: str, value):
-        if step not in self.graph_nodes:
-            return
-        if field in ("flowrate", "volume"):
-            try:
-                step[field] = float(value)
-            except ValueError:
-                return
-        else:
-            step[field] = value
-        self._graph_refresh_node_canvas_label(step)
-
-    def _graph_sidebar_update_wait(self, step: dict, value: str):
+    def _graph_sidebar_update_wait(self, step: dict, value: str) -> None:
         if step not in self.graph_nodes:
             return
         try:
@@ -3190,26 +3723,12 @@ class MainWindow(QtWidgets.QMainWindow):
         t = step.get("type")
 
         if t == "Move syringe":
-            syringe_combo = self._build_device_combo("syringe", step.get("syringe", ""))
-            syringe_combo.currentTextChanged.connect(
-                lambda text, s=step: self._graph_sidebar_update_move(s, "syringe", text)
+            migrate_flow_step_inplace(step)
+            self._append_move_syringe_param_rows(
+                self.graph_param_layout,
+                step,
+                for_flow_table=False,
             )
-
-            flow_edit = QtWidgets.QLineEdit(str(step.get("flowrate", 100.0)))
-            flow_edit.editingFinished.connect(
-                lambda fe=flow_edit, s=step: self._graph_sidebar_update_move(
-                    s, "flowrate", fe.text()
-                )
-            )
-
-            vol_edit = QtWidgets.QLineEdit(str(step.get("volume", 10.0)))
-            vol_edit.editingFinished.connect(
-                lambda ve=vol_edit, s=step: self._graph_sidebar_update_move(s, "volume", ve.text())
-            )
-
-            self.graph_param_layout.addRow("Syringe name:", syringe_combo)
-            self.graph_param_layout.addRow("Flowrate (ul/min):", flow_edit)
-            self.graph_param_layout.addRow("Volume (ul):", vol_edit)
 
         elif t == "Wait":
             sec_edit = QtWidgets.QLineEdit(str(step.get("seconds", 1.0)))
@@ -3301,12 +3820,9 @@ class MainWindow(QtWidgets.QMainWindow):
     def _graph_step_dict_for_type(self, step_type: str) -> dict:
         """Default step payload for a graph node type (same as flow designer)."""
         if step_type == "Move syringe":
-            return {
-                "type": "Move syringe",
-                "syringe": "",
-                "flowrate": 100.0,
-                "volume": 10.0,
-            }
+            nd = {"type": "Move syringe", "pumps": [_default_pump_dict()]}
+            migrate_flow_step_inplace(nd)
+            return nd
         if step_type == "Wait":
             return {
                 "type": "Wait",
@@ -3341,16 +3857,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.graph_scene.addItem(rect_item)
         rect_item.setPos(x, y)
 
-        label = self.graph_scene.addSimpleText(step_type)
-        label.setBrush(QtGui.QBrush(QtGui.QColor("white")))
-        label.setParentItem(rect_item)
-        label.setAcceptedMouseButtons(QtCore.Qt.MouseButton.NoButton)
-        label_rect = label.boundingRect()
-        label.setPos(
-            (node_width - label_rect.width()) / 2,
-            (node_height - label_rect.height()) / 2,
-        )
-
         cy = node_height / 2
         step["in_port"] = NodePortItem(rect_item, "in")
         step["in_port"].setPos(0, cy)
@@ -3358,11 +3864,12 @@ class MainWindow(QtWidgets.QMainWindow):
         step["out_port"].setPos(node_width, cy)
         step["incoming"] = []
         step["outgoing"] = []
-        step["label_item"] = label
 
         step["item"] = rect_item
         self.graph_nodes.append(step)
+        self._graph_refresh_node_canvas_label(step)
         self._graph_refresh_nodes_bar()
+        self._graph_update_scene_extent()
 
     def _graph_refresh_nodes_bar(self) -> None:
         """Rebuild the left-panel list of canvas nodes with Delete buttons."""
@@ -3413,6 +3920,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._graph_sidebar_step is node:
             self._graph_clear_param_sidebar()
         self._graph_refresh_nodes_bar()
+        self._graph_update_scene_extent()
 
     def _on_graph_add_node(self):
         step_type = self._graph_selected_component_text()
@@ -3420,7 +3928,7 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.information(
                 self,
                 "Add node",
-                "请在左侧列表中选择一种节点类型（或点击列表第一项后再试）。",
+                "Select a module type in the left list (or click the first item), then try again.",
             )
             return
         self._graph_add_node_from_type(step_type)
@@ -3432,7 +3940,7 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.information(
                 self,
                 "Delete connection",
-                "请在画布上点击选中一条连接线（箭头），再按此按钮删除。",
+                "Click a connection arrow on the canvas to select it, then use this button.",
             )
             return
         for item in selected_items:
@@ -3448,7 +3956,7 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.information(
                 self,
                 "Edit node",
-                "请先在画布上点击选中一个流程节点（方框），再编辑参数。",
+                "Select a flow node (rectangle) on the canvas first, then edit parameters.",
             )
             return
         item = selected_items[0]
@@ -3457,7 +3965,7 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.information(
                 self,
                 "Edit node",
-                "当前选中项不是流程节点。请点击节点方框（或空白处取消选中后重试）。",
+                "The current selection is not a flow node. Click a node rectangle (or empty canvas to clear), then try again.",
             )
             return
 
@@ -3473,6 +3981,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.graph_nodes.clear()
         self._graph_clear_param_sidebar()
         self._graph_refresh_nodes_bar()
+        self._graph_update_scene_extent()
 
     def _on_save_graph(self):
         if not self.graph_nodes:
@@ -3484,7 +3993,9 @@ class MainWindow(QtWidgets.QMainWindow):
         if not path:
             return
         _data_keys = {"type", "syringe", "flowrate", "volume", "seconds",
-                       "manifold", "v1", "v2", "v3", "v4"}
+                       "manifold", "v1", "v2", "v3", "v4",
+                       "pumps", "enable_second_syringe",
+                       "syringe_2", "flowrate_2", "volume_2"}
         node_id_map = {}
         nodes_out = []
         for i, n in enumerate(self.graph_nodes):
@@ -3556,27 +4067,46 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             nodes_data = nodes_data[:MAX_FLOW_ITEMS]
         _required = {
-            "Move syringe": ("syringe", "flowrate", "volume"),
+            LEGACY_DUAL_STEP_TYPE: (
+                "syringe_1", "flowrate_1", "volume_1",
+                "syringe_2", "flowrate_2", "volume_2",
+            ),
             "Wait": ("seconds",),
             "Switch valves": ("manifold", "v1", "v2", "v3", "v4"),
             "Stop board": (),
         }
-        _data_keys = {"syringe", "flowrate", "volume", "seconds",
-                       "manifold", "v1", "v2", "v3", "v4"}
+        _known_types_graph = set(_required) | {"Move syringe"}
+        _data_keys = {
+            "syringe", "flowrate", "volume", "seconds",
+            "manifold", "v1", "v2", "v3", "v4",
+            "pumps", "enable_second_syringe",
+            "syringe_1", "flowrate_1", "volume_1",
+            "syringe_2", "flowrate_2", "volume_2",
+        }
         self._on_graph_clear()
         id_to_node = {}
         for i, nd in enumerate(nodes_data):
             if not isinstance(nd, dict):
                 warnings.append(f"Node {i}: skipped (not a dict)")
                 continue
-            ntype = nd.get("type")
-            if ntype not in _required:
-                warnings.append(f"Node {i}: skipped (unknown type {ntype!r})")
+            raw_type = nd.get("type")
+            if not isinstance(raw_type, str) or raw_type not in _known_types_graph:
+                warnings.append(f"Node {i}: skipped (unknown type {raw_type!r})")
                 continue
-            missing = [k for k in _required[ntype] if k not in nd]
+            if raw_type == LEGACY_DUAL_STEP_TYPE:
+                missing = [k for k in _required[LEGACY_DUAL_STEP_TYPE] if k not in nd]
+            elif raw_type == "Move syringe":
+                if not move_syringe_step_has_loadable_payload(nd):
+                    warnings.append(f"Node {i}: skipped (Move syringe invalid payload)")
+                    continue
+                missing = []
+            else:
+                missing = [k for k in _required[raw_type] if k not in nd]
             if missing:
                 warnings.append(f"Node {i}: skipped (missing fields: {', '.join(missing)})")
                 continue
+            migrate_flow_step_inplace(nd)
+            ntype = nd.get("type")
             nid = nd.get("id", f"n{i}")
             if nid in id_to_node:
                 # Duplicate ids would let the later node overwrite the earlier
@@ -3591,6 +4121,8 @@ class MainWindow(QtWidgets.QMainWindow):
             for k in _data_keys:
                 if k in nd:
                     node[k] = nd[k]
+            migrate_flow_step_inplace(node)
+            self._graph_refresh_node_canvas_label(node)
             x = nd.get("x", 0)
             y = nd.get("y", i * 70)
             item = node.get("item")
@@ -3609,6 +4141,8 @@ class MainWindow(QtWidgets.QMainWindow):
                     continue
                 self._graph_create_edge(src, dst)
         self._schedule_graph_edge_positions()
+        self._graph_update_scene_extent()
+        QtCore.QTimer.singleShot(0, self._graph_fit_view)
         if warnings:
             QtWidgets.QMessageBox.warning(self, "Load warnings", "\n".join(warnings))
 
@@ -3705,26 +4239,87 @@ class StepParamDialog(QtWidgets.QDialog):
         t = step.get("type")
 
         if t == "Move syringe":
-            self.syringe_combo = QtWidgets.QComboBox()
-            self.syringe_combo.setEditable(True)
-            le = self.syringe_combo.lineEdit()
-            if le is not None:
-                le.setPlaceholderText("Device name (type or pick after connect)")
-            names = _device_names_from_board(self._board, "syringe")
-            self.syringe_combo.addItems(names)
-            cur = (step.get("syringe") or "").strip()
-            if cur:
-                if cur in names:
-                    self.syringe_combo.setCurrentText(cur)
-                else:
-                    self.syringe_combo.setEditText(cur)
+            migrate_flow_step_inplace(step)
+            scroll = QtWidgets.QScrollArea()
+            scroll.setMinimumHeight(240)
+            scroll.setWidgetResizable(True)
+            inner = QtWidgets.QWidget()
+            msp_form = QtWidgets.QFormLayout(inner)
+            scroll.setWidget(inner)
+            msp_state: dict = {"rows": []}
 
-            self.flow_edit = QtWidgets.QLineEdit(str(step.get("flowrate", 100.0)))
-            self.vol_edit = QtWidgets.QLineEdit(str(step.get("volume", 10.0)))
+            def rebuild_msp_rows() -> None:
+                while msp_form.rowCount():
+                    msp_form.removeRow(0)
+                msp_state["rows"].clear()
+                migrate_flow_step_inplace(step)
+                names = _device_names_from_board(self._board, "syringe")
+                hint = QtWidgets.QLabel(
+                    f"Up to {MOVE_SYRINGE_MAX_PARALLEL_PUMPS} pumps can run in parallel "
+                    "in this step; each row is one pump."
+                )
+                hint.setWordWrap(True)
+                msp_form.addRow(hint)
+                btn_w = QtWidgets.QWidget()
+                br = QtWidgets.QHBoxLayout(btn_w)
+                add_b = QtWidgets.QPushButton("Add parallel pump")
+                rem_b = QtWidgets.QPushButton("Remove last pump")
+                br.addWidget(add_b)
+                br.addWidget(rem_b)
+                br.addStretch(1)
+                msp_form.addRow("Pumps:", btn_w)
 
-            layout.addRow("Syringe name:", self.syringe_combo)
-            layout.addRow("Flowrate (ul/min):", self.flow_edit)
-            layout.addRow("Volume (ul):", self.vol_edit)
+                def on_add() -> None:
+                    migrate_flow_step_inplace(step)
+                    if len(step["pumps"]) >= MOVE_SYRINGE_MAX_PARALLEL_PUMPS:
+                        QtWidgets.QMessageBox.information(
+                            self,
+                            "Move syringe",
+                            f"At most {MOVE_SYRINGE_MAX_PARALLEL_PUMPS} pumps per step.",
+                        )
+                        return
+                    step["pumps"].append(_default_pump_dict())
+                    sync_legacy_move_syringe_mirror(step)
+                    rebuild_msp_rows()
+
+                def on_rem() -> None:
+                    migrate_flow_step_inplace(step)
+                    if len(step["pumps"]) <= 1:
+                        return
+                    step["pumps"].pop()
+                    sync_legacy_move_syringe_mirror(step)
+                    rebuild_msp_rows()
+
+                add_b.clicked.connect(on_add)
+                rem_b.clicked.connect(on_rem)
+
+                for idx, pump in enumerate(step["pumps"]):
+                    msp_form.addRow(
+                        QtWidgets.QLabel(f"— Pump {idx + 1} —"),
+                        QtWidgets.QLabel(""),
+                    )
+                    combo = QtWidgets.QComboBox()
+                    combo.setEditable(True)
+                    le = combo.lineEdit()
+                    if le is not None:
+                        le.setPlaceholderText("Device name (type or pick after connect)")
+                    combo.addItems(names)
+                    cur = str(pump.get("syringe", "") or "").strip()
+                    if cur:
+                        if cur in names:
+                            combo.setCurrentText(cur)
+                        else:
+                            combo.setEditText(cur)
+                    fe = QtWidgets.QLineEdit(str(pump.get("flowrate", 100.0)))
+                    ve = QtWidgets.QLineEdit(str(pump.get("volume", 10.0)))
+                    msp_form.addRow(f"Syringe {idx + 1}:", combo)
+                    msp_form.addRow(f"Flowrate {idx + 1} (µL/min):", fe)
+                    msp_form.addRow(f"Volume {idx + 1} (µL):", ve)
+                    msp_state["rows"].append((combo, fe, ve))
+
+            self._msp_collect_rows = lambda: msp_state["rows"]
+            rebuild_msp_rows()
+            layout.addRow(scroll)
 
         elif t == "Wait":
             self.sec_edit = QtWidgets.QLineEdit(str(step.get("seconds", 1.0)))
@@ -3780,9 +4375,21 @@ class StepParamDialog(QtWidgets.QDialog):
         t = self._step.get("type")
         try:
             if t == "Move syringe":
-                self._step["syringe"] = self.syringe_combo.currentText().strip()
-                self._step["flowrate"] = float(self.flow_edit.text().strip())
-                self._step["volume"] = float(self.vol_edit.text().strip())
+                migrate_flow_step_inplace(self._step)
+                rows = getattr(self, "_msp_collect_rows", lambda: [])()
+                pumps_out = []
+                for combo, fe, ve in rows:
+                    pumps_out.append(
+                        {
+                            "syringe": combo.currentText().strip(),
+                            "flowrate": float(fe.text().strip()),
+                            "volume": float(ve.text().strip()),
+                        }
+                    )
+                self._step["pumps"] = pumps_out[
+                    :MOVE_SYRINGE_MAX_PARALLEL_PUMPS
+                ]
+                sync_legacy_move_syringe_mirror(self._step)
             elif t == "Wait":
                 self._step["seconds"] = float(self.sec_edit.text().strip())
             elif t == "Switch valves":

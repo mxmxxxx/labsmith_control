@@ -256,6 +256,126 @@ class LabsmithBoard:
             OUTPUT.write(comment + "\n")
             print(comment)
 
+    def MoveParallel(self, moves):
+        """Start 2–4 syringe moves together; block until all finish or error.
+
+        ``moves`` is a sequence of (device_name, flowrate µL/min, volume µL).
+        Used by Flow Designer / Flow Graph when a **Move syringe** step selects
+        several parallel pumps (``pumps[]`` list, 2–4 entries). Cooperates with
+        ``poll_hook`` and ``cancel_requested`` like CSyringe.Updating.
+        """
+        if moves is None:
+            raise ValueError("MoveParallel: no pumps specified.")
+        pairs = list(moves)
+        n = len(pairs)
+        if n < 2:
+            raise ValueError("MoveParallel requires at least 2 pumps.")
+        if n > 4:
+            raise ValueError(f"MoveParallel supports at most 4 pumps, got {n}.")
+
+        targets = []
+        seen_names = set()
+        for namedevice, flowrate, volume in pairs:
+            name = str(namedevice or "").strip()
+            if not name:
+                raise ValueError("MoveParallel: empty syringe name.")
+            if name in seen_names:
+                raise ValueError(
+                    f"MoveParallel: duplicate syringe {name!r} in the same step."
+                )
+            seen_names.add(name)
+            i = self.FindIndexS(name)
+            s = self.SPS01[i]
+            try:
+                s.UpdateStatus()
+            except Exception as e:
+                raise RuntimeError(
+                    f"Syringe {name}: UpdateStatus failed before MoveParallel: {e}"
+                ) from e
+            if not s.FlagIsOnline:
+                raise RuntimeError(f"Syringe {name} is offline.")
+            if s.FlagIsStalled:
+                raise RuntimeError(f"Syringe {name} is stalled.")
+            if not s.FlagIsDone:
+                raise RuntimeError(
+                    f"Syringe {name} is busy — wait for the previous move to finish."
+                )
+            if not CSyringe._is_positive_number(flowrate):
+                raise RuntimeError(
+                    f"Syringe {name}: flowrate must be > 0 µL/min (got {flowrate!r})."
+                )
+            if not isinstance(volume, (int, float)) or float(volume) < 0:
+                raise RuntimeError(
+                    f"Syringe {name}: volume must be >= 0 µL (got {volume!r})."
+                )
+            targets.append((s, float(flowrate), float(volume)))
+
+        for s, flowrate, volume in targets:
+            rv = s.device.CmdSetFlowrate(flowrate)
+            if rv is False:
+                raise RuntimeError(
+                    f"Syringe {s.name}: CmdSetFlowrate({flowrate}) returned False."
+                )
+            s.Flowrate = flowrate
+
+        busy = [s.name for s, _, _ in targets if not s.FlagIsDone]
+        if busy:
+            raise RuntimeError(
+                f"MoveParallel: pump(s) not ready before move: {', '.join(busy)}"
+            )
+
+        for s, _, volume in targets:
+            rv = s.device.CmdMoveToVolume(volume)
+            if rv is False:
+                for delay_s in (0.03, 0.08, 0.15):
+                    time.sleep(delay_s)
+                    try:
+                        rv = s.device.CmdMoveToVolume(volume)
+                    except Exception:
+                        rv = False
+                    if rv is not False:
+                        break
+            if rv is False:
+                raise RuntimeError(
+                    f"Syringe {s.name}: CmdMoveToVolume({volume}) returned False."
+                )
+            s.FlagReady = False
+            s.displaymovement()
+
+        start = time.monotonic()
+        timeout_seconds = 2 * 60 * 60
+        while True:
+            if getattr(self, "cancel_requested", False) or getattr(self, "Stop", False):
+                break
+            hook = getattr(self, "poll_hook", None)
+            if callable(hook):
+                try:
+                    hook()
+                except Exception:
+                    pass
+            any_moving = False
+            for s, _, _ in targets:
+                s.UpdateStatus()
+                if s.FlagIsStalled:
+                    raise RuntimeError(
+                        f"Syringe {s.name} stalled during parallel move."
+                    )
+                if s.FlagIsMoving:
+                    any_moving = True
+            if not any_moving:
+                break
+            if time.monotonic() - start > timeout_seconds:
+                raise RuntimeError(
+                    f"MoveParallel timed out after {timeout_seconds}s."
+                )
+            time.sleep(0.01)
+
+        for s, _, _ in targets:
+            s.UpdateStatus()
+            if s.FlagIsDone:
+                s.displaymovementstop()
+            s.FlagReady = True
+
     ### Move2
     def Move2(self, namedevice, flowrate, volume):
         for i in range(len(self.SPS01)):

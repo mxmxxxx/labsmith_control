@@ -1,28 +1,28 @@
-LabSmith Control — Windows 打包说明
-====================================
+LabSmith Control — Windows packaging notes
+============================================
 
-1) 安装依赖（在已能运行 labsmith_gui.py 的环境里）:
+1) Install dependencies (in an environment where labsmith_gui.py already runs):
    pip install pyinstaller pyserial PyQt6 numpy
 
-2) 确保 Python/uProcess_x64/ 目录存在且含 uProcess_x64.pyd（及厂商附带 DLL）。
-   spec 会自动把整包 uProcess_x64 打进 exe。
+2) Ensure Python/uProcess_x64/ exists and contains uProcess_x64.pyd (and vendor DLLs).
+   The spec bundles the whole uProcess_x64 folder into the exe.
 
-3) 在 Python 目录执行:
+3) From the Python directory run:
    cd Python
    pyinstaller --noconfirm packaging/LabSmithControl.spec
 
-4) 输出:
-   Python/dist/LabSmithControl.exe   （无控制台窗口）
+4) Output:
+   Python/dist/LabSmithControl.exe   (no console window)
 
-5) 日志目录:
-   与 exe 同级的 logs/OUTPUT.txt
-   若安装到 Program Files 等只读位置，请设置环境变量:
-   LABSMITH_DATA_DIR=C:\Users\你\AppData\Local\LabSmithControl
-   再启动 exe，日志会写到该目录下的 logs/。
+5) Log directory:
+   logs/OUTPUT.txt next to the exe
+   If you install under Program Files or another read-only location, set:
+   LABSMITH_DATA_DIR=C:\Users\YourName\AppData\Local\LabSmithControl
+   then start the exe; logs go under logs/ in that folder.
 
-6) 自定义图标:
-   将 icon.ico 放在 packaging/ 下，编辑 LabSmithControl.spec 取消注释 icon= 那一行。
+6) Custom icon:
+   Put icon.ico under packaging/, then edit LabSmithControl.spec and uncomment the icon= line.
 
 7) macOS:
-   在同一 spec 上通常需去掉 console=False 或改用 .app 流程；建议在 Mac 上单独用 pyinstaller
-   生成 --windowed 的 .app，并处理代码签名（未签名可能被 Gatekeeper 拦截）。
+   You usually need to adjust console=False or use a separate .app workflow; on Mac, use pyinstaller
+   with --windowed for a .app and handle code signing (unsigned builds may be blocked by Gatekeeper).
