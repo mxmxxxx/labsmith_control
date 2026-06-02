@@ -12,8 +12,29 @@ except Exception:
     list_ports = None
 
 from LabsmithBoard import LabsmithBoard
+from mock_board import MockLabsmithBoard
 from device_registry import LEGACY_MANIFOLD_RE, LEGACY_SYRINGE_RE, resolve_device_ref
 from output_log import app_writable_root, log_directory, output_txt_path
+
+# Sentinel stored as the COM combo's itemData for the test/mock entry.
+MOCK_PORT_SENTINEL = "__MOCK__"
+
+
+def _qt_wrapper_alive(obj) -> bool:
+    """Return False if the underlying Qt C++ object was already destroyed."""
+    if obj is None:
+        return False
+    try:
+        from shiboken6 import isValid
+
+        return isValid(obj)
+    except ImportError:
+        try:
+            from PyQt6 import sip
+
+            return not sip.isdeleted(obj)
+        except Exception:
+            return True
 
 
 def parse_com_port_to_int(text_or_device: Optional[str]) -> Optional[int]:
@@ -1010,10 +1031,13 @@ class MainWindow(QtWidgets.QMainWindow):
         conn_layout.addWidget(QtWidgets.QLabel("COM Port:"))
         self.port_combo = QtWidgets.QComboBox()
         self.port_combo.setEditable(True)
-        self.port_combo.setFixedWidth(220)
+        self.port_combo.setMinimumWidth(260)
+        self.port_combo.setToolTip(
+            "Pick a COM port, type COM# (e.g. 3), or choose 'Mock board (no hardware)' to test the UI."
+        )
         le = self.port_combo.lineEdit()
         if le is not None:
-            le.setPlaceholderText("Pick from list or type COM# (e.g. 3)")
+            le.setPlaceholderText("Pick port / Mock board, or type COM# (e.g. 3)")
         conn_layout.addWidget(self.port_combo)
 
         self.refresh_ports_btn = QtWidgets.QPushButton("Refresh Ports")
@@ -1184,17 +1208,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self.v2_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
         self.v3_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
         self.v4_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self._valve_sliders = [
+            self.v1_slider, self.v2_slider, self.v3_slider, self.v4_slider
+        ]
+        self._valve_value_labels = []
         # One slider per row — four in a single grid row were ~80px wide each and often
         # unusable in the narrow left column (hard to drag / no hit target).
-        for idx, sl in enumerate(
-            [self.v1_slider, self.v2_slider, self.v3_slider, self.v4_slider], start=1
-        ):
+        for idx, sl in enumerate(self._valve_sliders, start=1):
             sl.setRange(0, 1)
             sl.setSingleStep(1)
             sl.setPageStep(1)
             sl.setTracking(True)
             sl.setMaximumHeight(32)
-            sl.setMinimumWidth(200)
+            sl.setMinimumWidth(180)
             sl.setSizePolicy(
                 QtWidgets.QSizePolicy.Policy.Expanding,
                 QtWidgets.QSizePolicy.Policy.Fixed,
@@ -1203,12 +1229,47 @@ class MainWindow(QtWidgets.QMainWindow):
                 f"V{idx} quick: 0/1 passed to CmdSetValves (0=no change, 1=position A). "
                 f"For codes 2=closed, 3=B use “4VM native” below."
             )
+            value_label = QtWidgets.QLabel()
+            value_label.setMinimumWidth(96)
+            value_label.setStyleSheet("color: #c8c8d8; font-size: 9pt;")
+            self._valve_value_labels.append(value_label)
+            sl.valueChanged.connect(
+                lambda _v, i=idx - 1: self._update_valve_value_label(i)
+            )
             row = 1 + idx
             m_layout.addWidget(QtWidgets.QLabel(f"V{idx}:"), row, 0)
-            m_layout.addWidget(sl, row, 1, 1, 3)
+            m_layout.addWidget(sl, row, 1, 1, 2)
+            m_layout.addWidget(value_label, row, 3)
+            self._update_valve_value_label(idx - 1)
 
-        self.switch_btn = QtWidgets.QPushButton("Switch valves")
-        m_layout.addWidget(self.switch_btn, 6, 0, 1, 4)
+        self.switch_btn = QtWidgets.QToolButton()
+        self.switch_btn.setText("Switch valves")
+        self.switch_btn.setToolButtonStyle(
+            QtCore.Qt.ToolButtonStyle.ToolButtonTextOnly
+        )
+        self.switch_btn.setFixedSize(150, 36)
+        self.switch_btn.setCursor(QtGui.QCursor(QtCore.Qt.CursorShape.PointingHandCursor))
+        self.switch_btn.setToolTip("Apply the V1–V4 quick codes above to the manifold.")
+        # A plain, solid, fixed-size button. Its visible area == its click area
+        # (no gradient/stretched grid span), so taps land reliably.
+        self.switch_btn.setStyleSheet(
+            "QToolButton {"
+            " background-color: #00a8e8; color: #ffffff; font-weight: 600;"
+            " border: none; border-radius: 8px; padding: 0; }"
+            "QToolButton:hover { background-color: #19b6f5; }"
+            "QToolButton:pressed { background-color: #0079ad; }"
+        )
+        # Center a compact, fixed-size button in its own row instead of
+        # stretching it across all four grid columns (which made it a very wide
+        # click target that was awkward to aim at).
+        switch_btn_row = QtWidgets.QHBoxLayout()
+        switch_btn_row.setContentsMargins(0, 6, 0, 6)
+        switch_btn_row.addStretch(1)
+        switch_btn_row.addWidget(
+            self.switch_btn, 0, QtCore.Qt.AlignmentFlag.AlignCenter
+        )
+        switch_btn_row.addStretch(1)
+        m_layout.addLayout(switch_btn_row, 6, 0, 1, 4)
 
         self.manifold_status_label = QtWidgets.QLabel("—")
         self.manifold_status_label.setWordWrap(True)
@@ -1745,13 +1806,16 @@ class MainWindow(QtWidgets.QMainWindow):
             self.move_btn,
             self.stop_syringe_btn,
             self.stop_board_btn,
-            self.switch_btn,
             self.microstep_run_btn,
             self.move_position_btn,
             self.native_valves_btn,
             self.motion_one_btn,
         ):
             w.setEnabled(ok)
+        # Keep "Switch valves" always clickable so a tap always reacts; the
+        # handler shows a clear "connect first" prompt when offline instead of
+        # being a silently-dead grey button.
+        self.switch_btn.setEnabled(True)
         self.monitor_status_cb.setEnabled(ok)
         self.bus_refresh_btn.setEnabled(ok)
         self.bus_stop_extras_btn.setEnabled(ok)
@@ -1922,9 +1986,16 @@ class MainWindow(QtWidgets.QMainWindow):
         return order
 
     def _graph_fit_view(self):
+        if not self._graph_scene_ok() or not _qt_wrapper_alive(
+            getattr(self, "graph_view", None)
+        ):
+            return
         self.graph_view.resetTransform()
         self._graph_update_scene_extent()
-        br = self.graph_scene.itemsBoundingRect()
+        try:
+            br = self.graph_scene.itemsBoundingRect()
+        except RuntimeError:
+            return
         if br.isValid() and not br.isEmpty():
             self.graph_view.fitInView(
                 br.adjusted(-48, -48, 48, 48),
@@ -1932,11 +2003,32 @@ class MainWindow(QtWidgets.QMainWindow):
             )
 
     # Connect / disconnect
+    def _is_mock_port_selected(self) -> bool:
+        if self.port_combo.currentData() == MOCK_PORT_SENTINEL:
+            return True
+        text = self.port_combo.currentText().strip().lower()
+        return text.startswith("mock")
+
     def _on_connect(self):
         if self._board is not None:
             QtWidgets.QMessageBox.information(self, "Info", "Already connected.")
             return
         if self._connect_in_progress:
+            return
+
+        # No-hardware test path: build an in-memory mock board immediately.
+        if self._is_mock_port_selected():
+            self._begin_busy("Connecting to mock board…")
+            try:
+                board = MockLabsmithBoard()
+            except Exception as exc:
+                self._end_busy()
+                QtWidgets.QMessageBox.critical(
+                    self, "Mock connect failed", str(exc)
+                )
+                return
+            self._on_connect_worker_finished(board, "")
+            self._append_log("Connected to mock (test) board — no hardware.")
             return
 
         port = self._get_selected_port_number()
@@ -2026,21 +2118,26 @@ class MainWindow(QtWidgets.QMainWindow):
             self._sync_connection_ui()
             self._update_status_bar()
 
+    def _add_mock_port_entry(self):
+        """Always offer a no-hardware test board as the first combo entry."""
+        self.port_combo.addItem("Mock board (no hardware)", MOCK_PORT_SENTINEL)
+
     def _refresh_serial_ports(self):
         """Populate COM port combo from system serial ports."""
         current_data = self.port_combo.currentData()
         typed = self.port_combo.currentText().strip()
         self.port_combo.clear()
+        self._add_mock_port_entry()
         if list_ports is None:
             le = self.port_combo.lineEdit()
             if le is not None:
                 le.setPlaceholderText(
-                    "No port list — type COM number (e.g. 3) or pip install pyserial"
+                    "No port list — type COM number (e.g. 3), or pick Mock (test) board"
                 )
             if typed:
                 self.port_combo.setEditText(typed)
             self.statusBar().showMessage(
-                "Install pyserial to list ports: pip install pyserial",
+                "Install pyserial to list real ports, or pick 'Mock (test) board' to try the UI.",
                 8000,
             )
             return
@@ -2370,6 +2467,16 @@ class MainWindow(QtWidgets.QMainWindow):
                 self, "Execution error", f"Error resetting syringe state:\n{e}"
             )
 
+    def _update_valve_value_label(self, i: int) -> None:
+        """Show the live 0/1 quick-code next to a valve slider."""
+        labels = getattr(self, "_valve_value_labels", None)
+        sliders = getattr(self, "_valve_sliders", None)
+        if not labels or not sliders or not (0 <= i < len(labels)):
+            return
+        v = sliders[i].value()
+        meaning = "no change" if v == 0 else "position A"
+        labels[i].setText(f"{v}  ({meaning})")
+
     # Manifold actions
     def _on_switch(self):
         if self._board is None:
@@ -2377,7 +2484,12 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         name = self._manifold_logical_name()
         if not name:
-            QtWidgets.QMessageBox.warning(self, "Error", "No manifold name available.")
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Error",
+                "No manifold name available. Connect a board (or the Mock board) "
+                "and pick a manifold in the dropdown first.",
+            )
             return
         v1 = self.v1_slider.value()
         v2 = self.v2_slider.value()
@@ -2389,6 +2501,28 @@ class MainWindow(QtWidgets.QMainWindow):
             dev.SwitchValves(v1, v2, v3, v4)
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Execution error", f"Error switching valves:\n{e}")
+            return
+
+        self._append_log(
+            f"{name}: SwitchValves({v1}, {v2}, {v3}, {v4}) sent."
+        )
+        # Give immediate visual feedback even when periodic monitoring is off.
+        try:
+            dev.UpdateStatus()
+            vst = getattr(dev, "V_status", None)
+            if vst is not None:
+                state = ", ".join(
+                    str(vst[i]) if i < len(vst) and vst[i] is not None else "?"
+                    for i in range(4)
+                )
+                self.manifold_status_label.setText(
+                    f"{name}: valves switched → status [{state}]"
+                )
+        except Exception:
+            self.manifold_status_label.setText(f"{name}: SwitchValves sent.")
+        self.statusBar().showMessage(
+            f"{name}: valves set to ({v1}, {v2}, {v3}, {v4}).", 4000
+        )
 
     def _on_microstep_run(self):
         s = self._current_syringe()
@@ -2769,10 +2903,15 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _graph_update_scene_extent(self) -> None:
         """Keep scene rect roomy so scrolling/zoom behaves with the current nodes."""
+        if not self._graph_scene_ok():
+            return
         if not self.graph_nodes:
             self.graph_scene.setSceneRect(QtCore.QRectF(-40, -40, 960, 520))
             return
-        br = self.graph_scene.itemsBoundingRect()
+        try:
+            br = self.graph_scene.itemsBoundingRect()
+        except RuntimeError:
+            return
         if br.isValid() and not br.isEmpty():
             self.graph_scene.setSceneRect(br.adjusted(-120, -80, 120, 80))
 
@@ -3578,6 +3717,7 @@ class MainWindow(QtWidgets.QMainWindow):
         center_box = QtWidgets.QGroupBox("Flow chart")
         center_layout = QtWidgets.QVBoxLayout(center_box)
         self.graph_scene = QtWidgets.QGraphicsScene()
+        self._graph_scene_mutating = False
         self.graph_view = FlowChartView(self.graph_scene)
         tip = QtWidgets.QLabel(
             "Tip: Ctrl+wheel zoom. Drag out→in to wire. Single-chain only: one in / one out per node, "
@@ -3676,10 +3816,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.graph_param_sidebar_hint.setVisible(True)
         self.graph_param_scroll.setVisible(False)
 
+    def _graph_scene_ok(self) -> bool:
+        return _qt_wrapper_alive(getattr(self, "graph_scene", None))
+
     def _graph_refresh_node_canvas_label(self, node: dict) -> None:
-        item: QtWidgets.QGraphicsRectItem = node["item"]
+        if not self._graph_scene_ok() or node not in self.graph_nodes:
+            return
+        item = node.get("item")
+        if not _qt_wrapper_alive(item):
+            return
         old_lbl = node.get("label_item")
-        if old_lbl is not None:
+        if old_lbl is not None and _qt_wrapper_alive(old_lbl):
             self.graph_scene.removeItem(old_lbl)
         text = self._graph_node_summary_text(node)
         label = self.graph_scene.addSimpleText(text)
@@ -3782,7 +3929,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self._graph_build_param_sidebar_for_step(self._graph_sidebar_step)
 
     def _on_graph_scene_selection_changed(self) -> None:
-        for item in self.graph_scene.selectedItems():
+        if getattr(self, "_graph_scene_mutating", False) or not self._graph_scene_ok():
+            return
+        try:
+            selected = self.graph_scene.selectedItems()
+        except RuntimeError:
+            return
+        for item in selected:
+            if not _qt_wrapper_alive(item):
+                continue
             node = self._graph_step_for_graphics_item(item)
             if node is not None:
                 self._graph_build_param_sidebar_for_step(node)
@@ -3915,7 +4070,17 @@ class MainWindow(QtWidgets.QMainWindow):
                 continue
             seen.add(rid)
             self._graph_remove_edge_record(r)
-        self.graph_scene.removeItem(node["item"])
+        self._graph_scene_mutating = True
+        try:
+            rect_item = node.get("item")
+            if self._graph_scene_ok() and _qt_wrapper_alive(rect_item):
+                self.graph_scene.blockSignals(True)
+                try:
+                    self.graph_scene.removeItem(rect_item)
+                finally:
+                    self.graph_scene.blockSignals(False)
+        finally:
+            self._graph_scene_mutating = False
         self.graph_nodes.remove(node)
         if self._graph_sidebar_step is node:
             self._graph_clear_param_sidebar()
@@ -3977,7 +4142,16 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_graph_clear(self):
         self.graph_edges.clear()
-        self.graph_scene.clear()
+        self._graph_scene_mutating = True
+        try:
+            if self._graph_scene_ok():
+                self.graph_scene.blockSignals(True)
+                try:
+                    self.graph_scene.clear()
+                finally:
+                    self.graph_scene.blockSignals(False)
+        finally:
+            self._graph_scene_mutating = False
         self.graph_nodes.clear()
         self._graph_clear_param_sidebar()
         self._graph_refresh_nodes_bar()
