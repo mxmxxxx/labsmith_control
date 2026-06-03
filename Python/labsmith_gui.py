@@ -1143,14 +1143,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
         conn_layout.addWidget(QtWidgets.QLabel("COM Port:"))
         self.port_combo = QtWidgets.QComboBox()
-        self.port_combo.setEditable(True)
         self.port_combo.setMinimumWidth(260)
         self.port_combo.setToolTip(
-            "Pick a COM port, type COM# (e.g. 3), or choose 'Mock board (no hardware)' to test the UI."
+            "Pick a detected COM port, or 'Mock board (no hardware)' to test the UI. "
+            "Use Refresh Ports to rescan."
         )
-        le = self.port_combo.lineEdit()
-        if le is not None:
-            le.setPlaceholderText("Pick port / Mock board, or type COM# (e.g. 3)")
         conn_layout.addWidget(self.port_combo)
 
         self.refresh_ports_btn = QtWidgets.QPushButton("Refresh Ports")
@@ -1471,9 +1468,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def closeEvent(self, event):
         self._settings.setValue("geometry", self.saveGeometry())
         self._settings.setValue("last_tab", self.tabs.currentIndex())
-        le = self.port_combo.lineEdit()
-        if le is not None:
-            self._settings.setValue("last_com_text", self.port_combo.currentText().strip())
+        self._save_last_com_pref()
         super().closeEvent(event)
 
     def _update_log_path_label(self):
@@ -1508,10 +1503,11 @@ class MainWindow(QtWidgets.QMainWindow):
         )
 
     def _restore_session_prefs(self):
-        last = self._settings.value("last_com_text", "")
-        le = self.port_combo.lineEdit()
-        if le is not None and last:
-            self.port_combo.setEditText(str(last))
+        last = self._settings.value("last_com_port", "")
+        if last:
+            idx = self.port_combo.findData(str(last))
+            if idx >= 0:
+                self.port_combo.setCurrentIndex(idx)
         try:
             ti = int(self._settings.value("last_tab", 0) or 0)
         except (TypeError, ValueError):
@@ -1520,9 +1516,9 @@ class MainWindow(QtWidgets.QMainWindow):
             self.tabs.setCurrentIndex(ti)
 
     def _save_last_com_pref(self):
-        le = self.port_combo.lineEdit()
-        if le is not None:
-            self._settings.setValue("last_com_text", self.port_combo.currentText().strip())
+        data = self.port_combo.currentData()
+        if data is not None and data != MOCK_PORT_SENTINEL:
+            self._settings.setValue("last_com_port", str(data))
 
     def _begin_busy(self, message: str = ""):
         self._busy_depth += 1
@@ -2171,19 +2167,11 @@ class MainWindow(QtWidgets.QMainWindow):
     def _refresh_serial_ports(self):
         """Populate COM port combo from system serial ports."""
         current_data = self.port_combo.currentData()
-        typed = self.port_combo.currentText().strip()
         self.port_combo.clear()
         self._add_mock_port_entry()
         if list_ports is None:
-            le = self.port_combo.lineEdit()
-            if le is not None:
-                le.setPlaceholderText(
-                    "No port list — type COM number (e.g. 3), or pick Mock (test) board"
-                )
-            if typed:
-                self.port_combo.setEditText(typed)
             self.statusBar().showMessage(
-                "Install pyserial to list real ports, or pick 'Mock (test) board' to try the UI.",
+                "Install pyserial to list real ports, or pick 'Mock board' to try the UI.",
                 8000,
             )
             return
@@ -2197,18 +2185,11 @@ class MainWindow(QtWidgets.QMainWindow):
             idx = self.port_combo.findData(current_data)
             if idx >= 0:
                 self.port_combo.setCurrentIndex(idx)
-            elif typed:
-                self.port_combo.setEditText(typed)
-        elif typed:
-            self.port_combo.setEditText(typed)
 
     def _get_selected_port_number(self):
         """Convert selected COMx to integer x used by LabsmithBoard."""
         device = self.port_combo.currentData()
-        port = parse_com_port_to_int(device) if device else None
-        if port is not None:
-            return port
-        return parse_com_port_to_int(self.port_combo.currentText())
+        return parse_com_port_to_int(device) if device else None
 
     def _try_connect_port(self, port_num: int):
         """Try creating board on a specific port; return board or None."""
