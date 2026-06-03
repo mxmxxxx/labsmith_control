@@ -3652,7 +3652,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.graph_components_list.setCurrentRow(0)
         left_layout.addWidget(self.graph_components_list)
         self.graph_components_list.setToolTip(
-            "Left-click a module type to add a node to the canvas (same as Add node)."
+            "Select a module type, then click 'Add node' (or double-click) to "
+            "place it on the canvas."
         )
 
         bar_box = QtWidgets.QGroupBox("Nodes on canvas")
@@ -3673,11 +3674,11 @@ class MainWindow(QtWidgets.QMainWindow):
         left_layout.addWidget(bar_box)
 
         self.graph_add_btn = QtWidgets.QPushButton("Add node")
-        self.graph_edit_btn = QtWidgets.QPushButton("Edit selected node")
+        self.graph_delete_node_btn = QtWidgets.QPushButton("Delete selected node")
         self.graph_delete_edge_btn = QtWidgets.QPushButton("Delete selected connection")
         self.graph_clear_btn = QtWidgets.QPushButton("Clear all")
         left_layout.addWidget(self.graph_add_btn)
-        left_layout.addWidget(self.graph_edit_btn)
+        left_layout.addWidget(self.graph_delete_node_btn)
         left_layout.addWidget(self.graph_delete_edge_btn)
         left_layout.addWidget(self.graph_clear_btn)
         left_layout.addStretch()
@@ -3761,8 +3762,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Signals
         self.graph_add_btn.clicked.connect(self._on_graph_add_node)
-        self.graph_components_list.itemClicked.connect(self._on_graph_component_item_clicked)
-        self.graph_edit_btn.clicked.connect(self._on_graph_edit_node)
+        # A single click only selects the module type; nodes are added explicitly
+        # via the "Add node" button. Double-click stays as an optional shortcut.
+        self.graph_components_list.itemDoubleClicked.connect(
+            self._on_graph_component_item_clicked
+        )
+        self.graph_delete_node_btn.clicked.connect(self._on_graph_delete_node)
         self.graph_delete_edge_btn.clicked.connect(self._on_graph_delete_edge)
         self.graph_clear_btn.clicked.connect(self._on_graph_clear)
         self.graph_run_btn.clicked.connect(self._on_graph_run)
@@ -3923,7 +3928,7 @@ class MainWindow(QtWidgets.QMainWindow):
         return None
 
     def _on_graph_component_item_clicked(self, item: QtWidgets.QListWidgetItem):
-        """Left-click a module type in the list → add that node to the canvas."""
+        """Double-click a module type → add that node (shortcut for 'Add node')."""
         t = item.text().strip() if item is not None else ""
         if t:
             self._graph_add_node_from_type(t)
@@ -4071,13 +4076,13 @@ class MainWindow(QtWidgets.QMainWindow):
                         self._graph_remove_edge_record(rec)
                         break
 
-    def _on_graph_edit_node(self):
+    def _on_graph_delete_node(self):
         selected_items = self.graph_scene.selectedItems()
         if not selected_items:
             QtWidgets.QMessageBox.information(
                 self,
-                "Edit node",
-                "Select a flow node (rectangle) on the canvas first, then edit parameters.",
+                "Delete node",
+                "Select a flow node (rectangle) on the canvas first, then delete it.",
             )
             return
         item = selected_items[0]
@@ -4085,16 +4090,12 @@ class MainWindow(QtWidgets.QMainWindow):
         if node is None:
             QtWidgets.QMessageBox.information(
                 self,
-                "Edit node",
-                "The current selection is not a flow node. Click a node rectangle (or empty canvas to clear), then try again.",
+                "Delete node",
+                "The current selection is not a flow node. Click a node rectangle "
+                "(or empty canvas to clear), then try again.",
             )
             return
-
-        dlg = StepParamDialog(self, self._board, node)
-        if dlg.exec() == QtWidgets.QDialog.DialogCode.Accepted:
-            self._graph_refresh_node_canvas_label(node)
-            if self._graph_sidebar_step is node:
-                self._graph_build_param_sidebar_for_step(node)
+        self._graph_delete_node(node)
 
     def _on_graph_clear(self):
         self.graph_edges.clear()
