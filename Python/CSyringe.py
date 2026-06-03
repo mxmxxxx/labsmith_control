@@ -1,8 +1,27 @@
 import numpy as np
 from datetime import datetime
+import math
 import time
 
 from output_log import output_txt_path
+
+# LabSmith SPS01 syringes share a 12 mm stroke; only the glass barrel diameter
+# changes between sizes. Standard wet volumes (µL): 4, 8, 20, 40, 80.
+SPS01_STROKE_MM = 12.0
+SPS01_STANDARD_VOLUMES_UL = (4.0, 8.0, 20.0, 40.0, 80.0)
+
+
+def diameter_mm_for_volume_ul(volume_ul, stroke_mm=SPS01_STROKE_MM):
+    """Barrel diameter (mm) giving ``volume_ul`` over a fixed stroke.
+
+    V = (pi/4) * d^2 * L  ->  d = sqrt(4V / (pi*L)).  With L = 12 mm this
+    returns 1.457 mm for 20 µL, matching the uProcess Configure dialog.
+    """
+    v = float(volume_ul)
+    L = float(stroke_mm)
+    if v <= 0 or L <= 0:
+        raise ValueError("volume and stroke must be positive")
+    return math.sqrt(4.0 * v / (math.pi * L))
 
 class CSyringe:
 
@@ -370,6 +389,121 @@ class CSyringe:
         """Move to 16-bit motor position (uProcess CmdMoveToPosition), not µL volume."""
         pos = int(position) & 0xFFFF
         return bool(self.device.CmdMoveToPosition(pos))
+
+    ### Syringe size / max volume (uProcess Configure dialog: CmdSetDiameter)
+    def SetMaxVolume(self, max_volume_ul, stroke_mm=SPS01_STROKE_MM):
+        """Reprogram the syringe size by setting its barrel diameter.
+
+        Mirrors the uProcess "Standard Size" selector: choosing a max volume
+        sets the corresponding glass diameter, after which the firmware-derived
+        max volume / flow limits are re-read. Returns the refreshed info dict.
+        """
+        diameter = diameter_mm_for_volume_ul(max_volume_ul, stroke_mm)
+        rv = self.device.CmdSetDiameter(float(diameter))
+        if rv is False:
+            raise RuntimeError(
+                f"Syringe {self.name}: CmdSetDiameter({diameter:.4f} mm) returned False."
+            )
+        # Re-read the values the firmware derives from the new diameter.
+        try:
+            self.diameter = self.device.CmdGetDiameter()
+        except Exception:
+            self.diameter = diameter
+        try:
+            self.maxVolume = self.device.GetMaxVolume()
+        except Exception:
+            self.maxVolume = float(max_volume_ul)
+        try:
+            self.maxFlowrate = self.device.GetMaxFlowrate()
+            self.minFlowrate = self.device.GetMinFlowrate()
+        except Exception:
+            pass
+        with open(output_txt_path(), "a") as OUTPUT:
+            comment = (
+                f"{datetime.now().strftime('%X')} Syringe {self.name}: size set to "
+                f"{float(max_volume_ul):.4g} µL (diameter {diameter:.4f} mm)."
+            )
+            OUTPUT.write(comment + "\n")
+            print(comment)
+        return {
+            "diameter": self.diameter,
+            "maxVolume": self.maxVolume,
+            "minFlowrate": self.minFlowrate,
+            "maxFlowrate": self.maxFlowrate,
+        }
+
+    ### Calibrate (uProcess Configure dialog: CmdAutoCal)
+    def Calibrate(self, timeout_seconds=180):
+        """Run the pump's auto-calibration and block until it finishes.
+
+        Cooperates with the GUI via the parent board's ``poll_hook`` so the UI
+        stays responsive, and ``cancel_requested`` so Stop can break out.
+        Raises RuntimeError on driver failure or timeout.
+        """
+        try:
+            self.UpdateStatus()
+        except Exception:
+            pass
+        if not self.FlagIsOnline:
+            raise RuntimeError(f"Syringe {self.name} is offline; cannot calibrate.")
+        rv = self.device.CmdAutoCal()
+        if rv is False:
+            raise RuntimeError(
+                f"Syringe {self.name}: CmdAutoCal returned False."
+            )
+        with open(output_txt_path(), "a") as OUTPUT:
+            comment = f"{datetime.now().strftime('%X')} Syringe {self.name}: calibrating…"
+            OUTPUT.write(comment + "\n")
+            print(comment)
+        start = time.monotonic()
+        while True:
+            try:
+                calibrating = bool(self.device.IsCalibrating())
+            except Exception:
+                calibrating = False
+            if not calibrating:
+                break
+            if getattr(self.Lboard, "cancel_requested", False) or \
+               getattr(self.Lboard, "Stop", False):
+                break
+            hook = getattr(self.Lboard, "poll_hook", None)
+            if callable(hook):
+                try:
+                    hook()
+                except Exception:
+                    pass
+            if time.monotonic() - start > timeout_seconds:
+                raise RuntimeError(
+                    f"Syringe {self.name}: calibration timed out after {timeout_seconds}s."
+                )
+            time.sleep(0.05)
+        self.UpdateStatus()
+        with open(output_txt_path(), "a") as OUTPUT:
+            comment = f"{datetime.now().strftime('%X')} Syringe {self.name}: calibration done."
+            OUTPUT.write(comment + "\n")
+            print(comment)
+        return True
+
+    ### Directional move (push out = dispense, pull in = aspirate)
+    def MoveDirectional(self, flowrate, amount_ul, push_out):
+        """Dispense (push out) or aspirate (pull in) ``amount_ul`` from the
+        current plunger position. Computes an absolute target and delegates to
+        MoveTo, clamping to [0, maxVolume]. Returns the target volume."""
+        try:
+            self.UpdateStatus()
+        except Exception:
+            pass
+        current = self.volume_ul if isinstance(self.volume_ul, (int, float)) else 0.0
+        amount = abs(float(amount_ul))
+        # Plunger "volume" is how much fluid is held: pushing out lowers it,
+        # pulling in raises it.
+        target = current - amount if push_out else current + amount
+        if target < 0.0:
+            target = 0.0
+        if isinstance(self.maxVolume, (int, float)) and target > float(self.maxVolume):
+            target = float(self.maxVolume)
+        self.MoveTo(flowrate, target)
+        return target
 
     ### Wait
     def Wait(self,time_sec):

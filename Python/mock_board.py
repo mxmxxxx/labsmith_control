@@ -36,8 +36,10 @@ class MockSyringe:
         self.name = name
         self.add_syr = addr
         self.address = addr
-        self.diameter = 4.61
-        self.maxVolume = 1000.0
+        # Default to a standard SPS01 size (20 µL) so the GUI size dropdown,
+        # info label and set-point range all agree out of the box.
+        self.diameter = 1.457
+        self.maxVolume = 20.0
         self.minFlowrate = 1.0
         self.maxFlowrate = 6000.0
 
@@ -94,6 +96,43 @@ class MockSyringe:
     def MoveToPosition16(self, pos: int) -> bool:
         _log(f"Syringe {self.name}: MoveToPosition16({pos})")
         return True
+
+    def SetMaxVolume(self, max_volume_ul, stroke_mm: float = 12.0):
+        import math
+        v = float(max_volume_ul)
+        self.diameter = math.sqrt(4.0 * v / (math.pi * float(stroke_mm)))
+        self.maxVolume = v
+        if self.volume_ul > v:
+            self.volume_ul = v
+        _log(
+            f"Syringe {self.name}: size set to {v:.4g} µL "
+            f"(diameter {self.diameter:.4f} mm)."
+        )
+        return {
+            "diameter": self.diameter,
+            "maxVolume": self.maxVolume,
+            "minFlowrate": self.minFlowrate,
+            "maxFlowrate": self.maxFlowrate,
+        }
+
+    def Calibrate(self, timeout_seconds: int = 180):
+        _log(f"Syringe {self.name}: Calibrate() (auto-cal simulated).")
+        return True
+
+    def MoveDirectional(self, flowrate, amount_ul, push_out):
+        current = self.volume_ul if isinstance(self.volume_ul, (int, float)) else 0.0
+        amount = abs(float(amount_ul))
+        target = current - amount if push_out else current + amount
+        if target < 0.0:
+            target = 0.0
+        if target > float(self.maxVolume):
+            target = float(self.maxVolume)
+        self.MoveTo(flowrate, target)
+        _log(
+            f"Syringe {self.name}: MoveDirectional("
+            f"{'push out' if push_out else 'pull in'}, amount={amount}, target={target})"
+        )
+        return target
 
 
 class MockManifold:

@@ -13,11 +13,18 @@ except Exception:
 
 from LabsmithBoard import LabsmithBoard
 from mock_board import MockLabsmithBoard
+from CSyringe import SPS01_STANDARD_VOLUMES_UL
 from device_registry import LEGACY_MANIFOLD_RE, LEGACY_SYRINGE_RE, resolve_device_ref
 from output_log import app_writable_root, log_directory, output_txt_path
 
 # Sentinel stored as the COM combo's itemData for the test/mock entry.
 MOCK_PORT_SENTINEL = "__MOCK__"
+
+# uProcess leaves a small headroom below the mechanical full-stroke volume so
+# the plunger never drives into the hard stop after calibration. We mirror that
+# by capping the usable Amount / Set-point travel to this fraction of the
+# nominal syringe size.
+SYRINGE_SAFE_FILL_FRACTION = 0.95
 
 
 def _qt_wrapper_alive(obj) -> bool:
@@ -1217,7 +1224,33 @@ class MainWindow(QtWidgets.QMainWindow):
         self.syringe_info_label.setStyleSheet("color: #a8a8b8; font-size: 10pt;")
         s_layout.addWidget(self.syringe_info_label, 1, 0, 1, 4)
 
-        s_layout.addWidget(QtWidgets.QLabel("Flowrate (µL/min):"), 2, 0)
+        # Syringe size (max volume) — mirrors the uProcess Configure dialog's
+        # "Standard Size" selector. Picking a size reprograms the barrel
+        # diameter via CmdSetDiameter.
+        s_layout.addWidget(QtWidgets.QLabel("Syringe size:"), 2, 0)
+        self.syringe_size_combo = QtWidgets.QComboBox()
+        for vol in SPS01_STANDARD_VOLUMES_UL:
+            self.syringe_size_combo.addItem(f"{vol:g} µL", float(vol))
+        self.syringe_size_combo.setToolTip(
+            "Standard SPS01 syringe size (max volume). Applies to the selected "
+            "pump via CmdSetDiameter."
+        )
+        self.syringe_size_combo.currentIndexChanged.connect(self._on_syringe_size_combo_changed)
+        s_layout.addWidget(self.syringe_size_combo, 2, 1)
+        self.apply_size_btn = QtWidgets.QPushButton("Apply size")
+        self.apply_size_btn.setToolTip("Reprogram the selected pump to this size.")
+        s_layout.addWidget(self.apply_size_btn, 2, 2, 1, 2)
+
+        # Two control modes (uProcess: Speed Control vs Position Monitoring &
+        # Control). Tab 1 = flowrate + volume (relative dispense/aspirate);
+        # tab 2 = absolute set point.
+        self.syringe_mode_tabs = QtWidgets.QTabWidget()
+        s_layout.addWidget(self.syringe_mode_tabs, 3, 0, 1, 4)
+
+        # --- Mode 1: Flow rate + Volume ---
+        fv_tab = QtWidgets.QWidget()
+        fv = QtWidgets.QGridLayout(fv_tab)
+        fv.addWidget(QtWidgets.QLabel("Flowrate (µL/min):"), 0, 0)
         self.flowrate_spin = QtWidgets.QDoubleSpinBox()
         self.flowrate_spin.setRange(0.0, 10000.0)
         self.flowrate_spin.setSingleStep(1.0)
@@ -1226,48 +1259,143 @@ class MainWindow(QtWidgets.QMainWindow):
         self.flowrate_spin.setToolTip(
             "Device min/max applied after connect (matches uProcess flow limits)."
         )
-        s_layout.addWidget(self.flowrate_spin, 2, 1)
+        fv.addWidget(self.flowrate_spin, 0, 1)
         self.flowrate_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
         self.flowrate_slider.setToolTip("Quick adjust within device range (capped for UI).")
-        s_layout.addWidget(self.flowrate_slider, 3, 0, 1, 4)
+        fv.addWidget(self.flowrate_slider, 1, 0, 1, 2)
         _wire_slider_spin(self.flowrate_slider, self.flowrate_spin, 1000, 10000.0)
 
-        s_layout.addWidget(QtWidgets.QLabel("Volume (µL):"), 4, 0)
+        fv.addWidget(QtWidgets.QLabel("Move direction:"), 2, 0)
+        self.direction_combo = QtWidgets.QComboBox()
+        self.direction_combo.addItem("Push out (dispense)", True)
+        self.direction_combo.addItem("Pull in (aspirate)", False)
+        self.direction_combo.setToolTip(
+            "Execute Move dispenses (push out) or aspirates (pull in) the Amount "
+            "below, relative to the current position."
+        )
+        fv.addWidget(self.direction_combo, 2, 1)
+
+        fv.addWidget(QtWidgets.QLabel("Amount (µL):"), 3, 0)
         self.volume_spin = QtWidgets.QDoubleSpinBox()
         self.volume_spin.setRange(0.0, 100000.0)
         self.volume_spin.setSingleStep(0.5)
         self.volume_spin.setDecimals(2)
         self.volume_spin.setValue(10.0)
-        self.volume_spin.setToolTip("Target volume; max stroke from device after connect.")
-        s_layout.addWidget(self.volume_spin, 4, 1)
+        self.volume_spin.setToolTip(
+            "Amount to dispense / aspirate in the chosen direction; capped by "
+            "device max stroke after connect."
+        )
+        fv.addWidget(self.volume_spin, 3, 1)
         self.volume_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
         self.volume_slider.setToolTip("Quick adjust 0–500 µL (or device max if lower).")
-        s_layout.addWidget(self.volume_slider, 5, 0, 1, 4)
+        fv.addWidget(self.volume_slider, 4, 0, 1, 2)
         _wire_slider_spin(self.volume_slider, self.volume_spin, 500, 100000.0)
 
         self.move_btn = QtWidgets.QPushButton("Execute Move")
+        fv.addWidget(self.move_btn, 5, 0, 1, 2)
+        self.syringe_mode_tabs.addTab(fv_tab, "Flow + Volume")
+
+        # --- Mode 2: Set point (absolute position) ---
+        sp_tab = QtWidgets.QWidget()
+        sp = QtWidgets.QGridLayout(sp_tab)
+        sp.addWidget(QtWidgets.QLabel("Flowrate (µL/min):"), 0, 0)
+        self.setpoint_flow_spin = QtWidgets.QDoubleSpinBox()
+        self.setpoint_flow_spin.setRange(0.0, 10000.0)
+        self.setpoint_flow_spin.setSingleStep(1.0)
+        self.setpoint_flow_spin.setDecimals(2)
+        self.setpoint_flow_spin.setValue(100.0)
+        self.setpoint_flow_spin.setToolTip("Move speed used to reach the set point.")
+        sp.addWidget(self.setpoint_flow_spin, 0, 1)
+        self.setpoint_flow_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        sp.addWidget(self.setpoint_flow_slider, 1, 0, 1, 2)
+        _wire_slider_spin(self.setpoint_flow_slider, self.setpoint_flow_spin, 1000, 10000.0)
+
+        sp.addWidget(QtWidgets.QLabel("Set point (µL):"), 2, 0)
+        self.setpoint_spin = QtWidgets.QDoubleSpinBox()
+        self.setpoint_spin.setRange(0.0, 100000.0)
+        self.setpoint_spin.setSingleStep(0.5)
+        self.setpoint_spin.setDecimals(3)
+        self.setpoint_spin.setValue(0.0)
+        self.setpoint_spin.setToolTip(
+            "Absolute plunger position as a volume; 'Go to position' moves "
+            "straight here (uProcess Set Point)."
+        )
+        sp.addWidget(self.setpoint_spin, 2, 1)
+        self.setpoint_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.setpoint_slider.setToolTip("Drag to pick an absolute position (0–max stroke).")
+        sp.addWidget(self.setpoint_slider, 3, 0, 1, 2)
+        _wire_slider_spin(self.setpoint_slider, self.setpoint_spin, 500, 100000.0)
+
+        self.go_position_btn = QtWidgets.QPushButton("Go to position")
+        self.go_position_btn.setToolTip(
+            "Move the plunger to the Set point volume at the flowrate above."
+        )
+        sp.addWidget(self.go_position_btn, 4, 0, 1, 2)
+
+        # Jog controls (uProcess |< << < > >> >| step buttons).
+        sp.addWidget(QtWidgets.QLabel("Step size (µL):"), 5, 0)
+        self.step_spin = QtWidgets.QDoubleSpinBox()
+        self.step_spin.setRange(0.001, 100000.0)
+        self.step_spin.setDecimals(3)
+        self.step_spin.setSingleStep(0.1)
+        self.step_spin.setValue(1.0)
+        self.step_spin.setToolTip("Increment used by the < and > jog buttons (>> / << use 10×).")
+        sp.addWidget(self.step_spin, 5, 1)
+
+        jog_row = QtWidgets.QHBoxLayout()
+        jog_row.setSpacing(3)
+        # (text, tooltip, action factor). Extremes use None and a to_max flag.
+        self.jog_min_btn = QtWidgets.QPushButton("|<")
+        self.jog_min_btn.setToolTip("Move fully out → 0 µL.")
+        self.jog_bigdown_btn = QtWidgets.QPushButton("<<")
+        self.jog_bigdown_btn.setToolTip("Push out 10 × step.")
+        self.jog_down_btn = QtWidgets.QPushButton("<")
+        self.jog_down_btn.setToolTip("Push out 1 × step.")
+        self.jog_up_btn = QtWidgets.QPushButton(">")
+        self.jog_up_btn.setToolTip("Pull in 1 × step.")
+        self.jog_bigup_btn = QtWidgets.QPushButton(">>")
+        self.jog_bigup_btn.setToolTip("Pull in 10 × step.")
+        self.jog_max_btn = QtWidgets.QPushButton(">|")
+        self.jog_max_btn.setToolTip("Move fully in → max volume.")
+        self._jog_buttons = [
+            self.jog_min_btn, self.jog_bigdown_btn, self.jog_down_btn,
+            self.jog_up_btn, self.jog_bigup_btn, self.jog_max_btn,
+        ]
+        for b in self._jog_buttons:
+            b.setMaximumWidth(44)
+            jog_row.addWidget(b)
+        sp.addLayout(jog_row, 6, 0, 1, 2)
+
+        self.syringe_mode_tabs.addTab(sp_tab, "Set point")
+
+        # --- Common controls (apply to both modes) ---
         self.stop_syringe_btn = QtWidgets.QPushButton("Stop this syringe")
         self.stop_syringe_btn.setToolTip("CmdStop on selected pump only (uProcess red stop per device).")
         self.stop_board_btn = QtWidgets.QPushButton("StopBoard")
-        s_layout.addWidget(self.move_btn, 6, 0, 1, 1)
-        s_layout.addWidget(self.stop_syringe_btn, 6, 1, 1, 1)
-        s_layout.addWidget(self.stop_board_btn, 6, 2, 1, 2)
+        s_layout.addWidget(self.stop_syringe_btn, 4, 0, 1, 2)
+        s_layout.addWidget(self.stop_board_btn, 4, 2, 1, 2)
+
+        self.calibrate_btn = QtWidgets.QPushButton("Calibrate")
+        self.calibrate_btn.setToolTip(
+            "Run the pump's auto-calibration (uProcess CmdAutoCal)."
+        )
+        s_layout.addWidget(self.calibrate_btn, 5, 0, 1, 2)
         self.reset_syringe_state_btn = QtWidgets.QPushButton("Reset syringe state")
         self.reset_syringe_state_btn.setToolTip(
             "Stop + refresh runtime status; if current volume is negative, "
             "attempt a safe move back to 0 µL."
         )
-        s_layout.addWidget(self.reset_syringe_state_btn, 7, 0, 1, 4)
+        s_layout.addWidget(self.reset_syringe_state_btn, 5, 2, 1, 2)
 
         self.monitor_status_cb = QtWidgets.QCheckBox("Live status (≈4 Hz)")
         self.monitor_status_cb.setToolTip(
             "Poll uProcess status: volume, online, moving, stall; manifold valves."
         )
-        s_layout.addWidget(self.monitor_status_cb, 8, 0, 1, 1)
+        s_layout.addWidget(self.monitor_status_cb, 6, 0, 1, 1)
         self.syringe_status_label = QtWidgets.QLabel("—")
         self.syringe_status_label.setWordWrap(True)
         self.syringe_status_label.setStyleSheet("color: #c8c8d8; font-size: 9pt;")
-        s_layout.addWidget(self.syringe_status_label, 8, 1, 1, 3)
+        s_layout.addWidget(self.syringe_status_label, 6, 1, 1, 3)
 
         # Manifold control (4VM) — single consolidated panel.
         # Each valve is a dropdown with its four native CmdSetValves codes; one
@@ -1396,6 +1524,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.refresh_ports_btn.clicked.connect(self._refresh_serial_ports)
         self.auto_detect_btn.clicked.connect(self._on_auto_detect)
         self.move_btn.clicked.connect(self._on_move)
+        self.go_position_btn.clicked.connect(self._on_go_to_position)
+        self.jog_min_btn.clicked.connect(lambda: self._on_syringe_jog_extreme(False))
+        self.jog_max_btn.clicked.connect(lambda: self._on_syringe_jog_extreme(True))
+        self.jog_bigdown_btn.clicked.connect(lambda: self._on_syringe_jog(-10.0))
+        self.jog_down_btn.clicked.connect(lambda: self._on_syringe_jog(-1.0))
+        self.jog_up_btn.clicked.connect(lambda: self._on_syringe_jog(1.0))
+        self.jog_bigup_btn.clicked.connect(lambda: self._on_syringe_jog(10.0))
+        self.apply_size_btn.clicked.connect(self._on_apply_syringe_size)
+        self.calibrate_btn.clicked.connect(self._on_calibrate_syringe)
         self.stop_syringe_btn.clicked.connect(self._on_stop_syringe)
         self.stop_board_btn.clicked.connect(self._on_stop_board)
         self.reset_syringe_state_btn.clicked.connect(self._on_reset_syringe_state)
@@ -1849,6 +1986,15 @@ class MainWindow(QtWidgets.QMainWindow):
         # Hardware commands only when uProcess link is up.
         for w in (
             self.move_btn,
+            self.go_position_btn,
+            self.jog_min_btn,
+            self.jog_bigdown_btn,
+            self.jog_down_btn,
+            self.jog_up_btn,
+            self.jog_bigup_btn,
+            self.jog_max_btn,
+            self.apply_size_btn,
+            self.calibrate_btn,
             self.stop_syringe_btn,
             self.stop_board_btn,
             self.motion_one_btn,
@@ -2338,22 +2484,79 @@ class MainWindow(QtWidgets.QMainWindow):
             self.flowrate_slider.setValue(int(round(min(max(fv, mn), float(sl_max)))))
             self.flowrate_slider.blockSignals(False)
 
-            maxv = max(0.0, float(s.maxVolume))
-            self.volume_spin.setRange(0.0, maxv)
-            vc = self.volume_spin.value()
-            if vc > maxv:
-                self.volume_spin.setValue(maxv)
-            self.volume_slider.blockSignals(True)
-            if maxv <= 0:
-                self.volume_slider.setRange(0, 0)
-                self.volume_slider.setValue(0)
-            else:
-                vs_cap = int(min(500, max(1, round(maxv))))
-                self.volume_slider.setRange(0, vs_cap)
-                self.volume_slider.setValue(int(round(min(vc, float(vs_cap)))))
-            self.volume_slider.blockSignals(False)
+            # Set-point tab shares the same flow speed limits.
+            self.setpoint_flow_spin.setRange(mn, mx)
+            spf = self.setpoint_flow_spin.value()
+            if spf < mn:
+                self.setpoint_flow_spin.setValue(mn)
+            elif spf > mx:
+                self.setpoint_flow_spin.setValue(mx)
+            self.setpoint_flow_slider.blockSignals(True)
+            self.setpoint_flow_slider.setRange(0, sl_max)
+            self.setpoint_flow_slider.setValue(
+                int(round(min(max(self.setpoint_flow_spin.value(), mn), float(sl_max))))
+            )
+            self.setpoint_flow_slider.blockSignals(False)
+
+            # Plunger travel (Amount + absolute Set point) follows the selected
+            # syringe size so the controls always agree with the size dropdown.
+            self._apply_travel_ranges(self._selected_syringe_size_ul(float(s.maxVolume)))
         except Exception:
             pass
+
+    def _selected_syringe_size_ul(self, fallback: float = 0.0) -> float:
+        """Return the syringe size currently chosen in the dropdown (µL)."""
+        try:
+            data = self.syringe_size_combo.currentData()
+            if data is not None:
+                return max(0.0, float(data))
+        except (TypeError, ValueError):
+            pass
+        return max(0.0, float(fallback))
+
+    def _usable_max_volume(self, nominal: float) -> float:
+        """Protective upper travel limit (mirrors uProcess post-calibration
+        headroom): a few percent below the mechanical full stroke so the
+        plunger never reaches the hard stop."""
+        return max(0.0, float(nominal)) * SYRINGE_SAFE_FILL_FRACTION
+
+    def _apply_travel_ranges(self, maxv: float):
+        """Clamp Amount + absolute Set point widgets to the usable travel
+        (0..safe-max µL, kept below the mechanical full stroke)."""
+        maxv = self._usable_max_volume(maxv)
+        self.volume_spin.setRange(0.0, maxv)
+        vc = self.volume_spin.value()
+        if vc > maxv:
+            self.volume_spin.setValue(maxv)
+        self.volume_slider.blockSignals(True)
+        if maxv <= 0:
+            self.volume_slider.setRange(0, 0)
+            self.volume_slider.setValue(0)
+        else:
+            vs_cap = int(min(500, max(1, round(maxv))))
+            self.volume_slider.setRange(0, vs_cap)
+            self.volume_slider.setValue(int(round(min(self.volume_spin.value(), float(vs_cap)))))
+        self.volume_slider.blockSignals(False)
+
+        self.setpoint_spin.setRange(0.0, maxv)
+        sp = self.setpoint_spin.value()
+        if sp > maxv:
+            self.setpoint_spin.setValue(maxv)
+        self.setpoint_slider.blockSignals(True)
+        if maxv <= 0:
+            self.setpoint_slider.setRange(0, 0)
+            self.setpoint_slider.setValue(0)
+        else:
+            sp_cap = int(min(500, max(1, round(maxv))))
+            self.setpoint_slider.setRange(0, sp_cap)
+            self.setpoint_slider.setValue(
+                int(round(min(self.setpoint_spin.value(), float(sp_cap))))
+            )
+        self.setpoint_slider.blockSignals(False)
+
+    def _on_syringe_size_combo_changed(self, *_):
+        """Keep travel ranges in sync the moment the size dropdown changes."""
+        self._apply_travel_ranges(self._selected_syringe_size_ul())
 
     def _on_syringe_selection_changed(self):
         s = self._current_syringe()
@@ -2361,13 +2564,33 @@ class MainWindow(QtWidgets.QMainWindow):
             self.syringe_info_label.setText("—")
             return
         try:
+            self._sync_syringe_size_combo(s)
             self._apply_syringe_hw_ranges(s)
+            usable = self._usable_max_volume(self._selected_syringe_size_ul(float(s.maxVolume)))
             self.syringe_info_label.setText(
-                f"Diameter: {s.diameter} · Max stroke: {float(s.maxVolume):.4g} µL · "
+                f"Diameter: {s.diameter} · Max stroke: {float(s.maxVolume):.4g} µL "
+                f"(usable {usable:.4g} µL) · "
                 f"Flow limits: {float(s.minFlowrate):.4g}–{float(s.maxFlowrate):.4g} µL/min"
             )
         except Exception:
             self.syringe_info_label.setText(str(getattr(s, "name", "?")))
+
+    def _sync_syringe_size_combo(self, s):
+        """Preselect the standard size closest to the syringe's max volume."""
+        try:
+            maxv = float(s.maxVolume)
+        except (TypeError, ValueError):
+            return
+        best_idx, best_diff = -1, None
+        for i in range(self.syringe_size_combo.count()):
+            opt = float(self.syringe_size_combo.itemData(i))
+            diff = abs(opt - maxv)
+            if best_diff is None or diff < best_diff:
+                best_idx, best_diff = i, diff
+        if best_idx >= 0:
+            self.syringe_size_combo.blockSignals(True)
+            self.syringe_size_combo.setCurrentIndex(best_idx)
+            self.syringe_size_combo.blockSignals(False)
 
     def _on_manifold_selection_changed(self):
         m = self._current_manifold()
@@ -2434,16 +2657,132 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._board is None:
             QtWidgets.QMessageBox.warning(self, "Not connected", "Please connect the board first.")
             return
-        name = self._syringe_logical_name()
-        if not name:
-            QtWidgets.QMessageBox.warning(self, "Error", "No syringe name available.")
+        s = self._current_syringe()
+        if s is None:
+            QtWidgets.QMessageBox.warning(self, "Error", "No syringe selected.")
             return
         flow = self.flowrate_spin.value()
-        vol = self.volume_spin.value()
+        amount = self.volume_spin.value()
+        push_out = bool(self.direction_combo.currentData())
         try:
-            self._board.Move(name, flow, vol)
+            target = s.MoveDirectional(flow, amount, push_out)
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Execution error", f"Error calling Move:\n{e}")
+            return
+        verb = "Dispensing" if push_out else "Aspirating"
+        self.statusBar().showMessage(
+            f"{getattr(s, 'name', '?')}: {verb} {amount:g} µL → target {target:g} µL.",
+            4000,
+        )
+
+    def _syringe_move_to_absolute(self, target):
+        """Move the selected syringe to an absolute volume; clamps to [0, max]."""
+        if self._board is None:
+            QtWidgets.QMessageBox.warning(self, "Not connected", "Please connect the board first.")
+            return
+        s = self._current_syringe()
+        if s is None:
+            QtWidgets.QMessageBox.warning(self, "Error", "No syringe selected.")
+            return
+        # Cap to the smaller of the selected size (set-point range) and the
+        # hardware limit, so the move never exceeds the displayed set point.
+        caps = [float(self.setpoint_spin.maximum())]
+        maxv = getattr(s, "maxVolume", None)
+        if isinstance(maxv, (int, float)) and float(maxv) > 0:
+            caps.append(float(maxv))
+        cap = min(caps)
+        tgt = float(target)
+        if tgt < 0.0:
+            tgt = 0.0
+        if cap > 0 and tgt > cap:
+            tgt = cap
+        flow = self.setpoint_flow_spin.value()
+        try:
+            s.MoveTo(flow, tgt)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Execution error", f"Error moving to position:\n{e}")
+            return
+        # Reflect the commanded target in the set-point field.
+        self.setpoint_spin.blockSignals(True)
+        self.setpoint_spin.setValue(tgt)
+        self.setpoint_spin.blockSignals(False)
+        self.statusBar().showMessage(
+            f"{getattr(s, 'name', '?')}: moving to {tgt:g} µL.", 4000
+        )
+
+    def _on_go_to_position(self):
+        self._syringe_move_to_absolute(self.setpoint_spin.value())
+
+    def _on_syringe_jog(self, factor):
+        """Step the plunger by factor × step size from its current position."""
+        s = self._current_syringe()
+        if s is None:
+            QtWidgets.QMessageBox.warning(self, "Error", "No syringe selected.")
+            return
+        try:
+            s.UpdateStatus()
+        except Exception:
+            pass
+        current = getattr(s, "volume_ul", None)
+        if not isinstance(current, (int, float)):
+            current = self.setpoint_spin.value()
+        delta = float(self.step_spin.value()) * float(factor)
+        self._syringe_move_to_absolute(float(current) + delta)
+
+    def _on_syringe_jog_extreme(self, to_max):
+        """|< → 0 µL (fully out); >| → max volume (fully in)."""
+        s = self._current_syringe()
+        if s is None:
+            QtWidgets.QMessageBox.warning(self, "Error", "No syringe selected.")
+            return
+        if to_max:
+            target = float(self.setpoint_spin.maximum())
+        else:
+            target = 0.0
+        self._syringe_move_to_absolute(target)
+
+    def _on_apply_syringe_size(self):
+        s = self._current_syringe()
+        if s is None:
+            QtWidgets.QMessageBox.warning(self, "Error", "Select a syringe first.")
+            return
+        max_vol = float(self.syringe_size_combo.currentData())
+        try:
+            s.SetMaxVolume(max_vol)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Set size", f"Could not set syringe size:\n{e}")
+            return
+        self._apply_syringe_hw_ranges(s)
+        self._on_syringe_selection_changed()
+        self.statusBar().showMessage(
+            f"{getattr(s, 'name', '?')}: syringe size set to {max_vol:g} µL.", 4000
+        )
+
+    def _on_calibrate_syringe(self):
+        s = self._current_syringe()
+        if s is None:
+            QtWidgets.QMessageBox.warning(self, "Error", "Select a syringe first.")
+            return
+        resp = QtWidgets.QMessageBox.question(
+            self,
+            "Calibrate",
+            f"Run auto-calibration on '{getattr(s, 'name', '?')}'?\n"
+            "The plunger will move through its full travel.",
+        )
+        if resp != QtWidgets.QMessageBox.StandardButton.Yes:
+            return
+        self._begin_busy(f"Calibrating {getattr(s, 'name', '?')}…")
+        try:
+            s.Calibrate()
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Calibrate", f"Calibration failed:\n{e}")
+            return
+        finally:
+            self._end_busy()
+        self._on_syringe_selection_changed()
+        self.statusBar().showMessage(
+            f"{getattr(s, 'name', '?')}: calibration complete.", 4000
+        )
 
     def _on_stop_syringe(self):
         if self._board is None:
@@ -3214,12 +3553,16 @@ class MainWindow(QtWidgets.QMainWindow):
                             f"{tag}: pump {pj} volume must be > 0 (got {vol!r})."
                         )
             elif t == "Switch valves":
+                # CmdSetValves codes: 0 No change · 1 Position A · 2 Closed · 3 Position B.
+                valid_codes = {code for _label, code in VALVE_POSITION_OPTIONS}
                 for vk in ("v1", "v2", "v3", "v4"):
                     v = step.get(vk, 0)
                     # bool is an int subclass; reject it explicitly or `True in
-                    # (0, 1)` would pass and become `1` at runtime.
-                    if isinstance(v, bool) or not isinstance(v, (int, float)) or v not in (0, 1):
-                        errors.append(f"{tag}: {vk} must be 0 or 1 (got {v!r}).")
+                    # valid_codes` would pass and become `1` at runtime.
+                    if isinstance(v, bool) or not isinstance(v, (int, float)) or int(v) not in valid_codes:
+                        errors.append(
+                            f"{tag}: {vk} must be 0–3 (0 No change, 1 A, 2 Closed, 3 B) (got {v!r})."
+                        )
             elif t == "Wait":
                 sec = step.get("seconds", 0)
                 if not _is_valid_number(sec) or sec <= 0:
@@ -4488,24 +4831,16 @@ class StepParamDialog(QtWidgets.QDialog):
                 else:
                     self.manifold_combo.setEditText(curm)
 
-            self.v1_spin = QtWidgets.QSpinBox()
-            self.v2_spin = QtWidgets.QSpinBox()
-            self.v3_spin = QtWidgets.QSpinBox()
-            self.v4_spin = QtWidgets.QSpinBox()
-            for spin, key in [
-                (self.v1_spin, "v1"),
-                (self.v2_spin, "v2"),
-                (self.v3_spin, "v3"),
-                (self.v4_spin, "v4"),
-            ]:
-                spin.setRange(0, 1)
-                spin.setValue(int(step.get(key, 0)))
+            self.v1_combo = make_valve_position_combo(int(step.get("v1", 0)))
+            self.v2_combo = make_valve_position_combo(int(step.get("v2", 0)))
+            self.v3_combo = make_valve_position_combo(int(step.get("v3", 0)))
+            self.v4_combo = make_valve_position_combo(int(step.get("v4", 0)))
 
             layout.addRow("Manifold name:", self.manifold_combo)
-            layout.addRow("V1:", self.v1_spin)
-            layout.addRow("V2:", self.v2_spin)
-            layout.addRow("V3:", self.v3_spin)
-            layout.addRow("V4:", self.v4_spin)
+            layout.addRow("V1:", self.v1_combo)
+            layout.addRow("V2:", self.v2_combo)
+            layout.addRow("V3:", self.v3_combo)
+            layout.addRow("V4:", self.v4_combo)
 
         else:
             info = QtWidgets.QLabel("Stop board: no parameters.")
@@ -4542,10 +4877,10 @@ class StepParamDialog(QtWidgets.QDialog):
                 self._step["seconds"] = float(self.sec_edit.text().strip())
             elif t == "Switch valves":
                 self._step["manifold"] = self.manifold_combo.currentText().strip()
-                self._step["v1"] = int(self.v1_spin.value())
-                self._step["v2"] = int(self.v2_spin.value())
-                self._step["v3"] = int(self.v3_spin.value())
-                self._step["v4"] = int(self.v4_spin.value())
+                self._step["v1"] = int(self.v1_combo.currentData())
+                self._step["v2"] = int(self.v2_combo.currentData())
+                self._step["v3"] = int(self.v3_combo.currentData())
+                self._step["v4"] = int(self.v4_combo.currentData())
         except ValueError:
             QtWidgets.QMessageBox.warning(
                 self, "Input error", "Please enter valid numeric values."
