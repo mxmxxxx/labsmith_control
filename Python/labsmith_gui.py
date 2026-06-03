@@ -247,6 +247,119 @@ def move_syringe_step_has_loadable_payload(step: dict) -> bool:
     return "syringe" in step and "flowrate" in step and "volume" in step
 
 
+# Valve position choices for CmdSetValves (label, native code).
+VALVE_POSITION_OPTIONS = (
+    ("No change", 0),
+    ("Position A", 1),
+    ("Closed", 2),
+    ("Position B", 3),
+)
+
+
+def make_valve_position_combo(current_code: int = 0):
+    """A dropdown listing the four CmdSetValves positions, preselected to code."""
+    combo = QtWidgets.QComboBox()
+    for label, code in VALVE_POSITION_OPTIONS:
+        combo.addItem(f"{code} — {label}", code)
+    idx = combo.findData(int(current_code))
+    combo.setCurrentIndex(idx if idx >= 0 else 0)
+    return combo
+
+
+# Keys carrying step parameters (everything except graph layout/topology).
+FLOW_STEP_DATA_KEYS = (
+    "type", "syringe", "flowrate", "volume", "seconds",
+    "manifold", "v1", "v2", "v3", "v4",
+    "pumps", "enable_second_syringe",
+    "syringe_1", "flowrate_1", "volume_1",
+    "syringe_2", "flowrate_2", "volume_2",
+)
+
+
+def _strip_step_payload(node: dict) -> dict:
+    """Copy only the step-parameter keys out of a node/step dict."""
+    return {k: node[k] for k in FLOW_STEP_DATA_KEYS if k in node}
+
+
+def graph_data_to_steps(data: dict):
+    """Linearise a ``flow_graph`` payload into an ordered list of step dicts.
+
+    Follows explicit edges via a Kahn topological sort (matching how the graph
+    executes). If the graph branches, has a cycle, or is disconnected, falls
+    back to the node file order so the conversion is always best-effort and
+    never throws. Returns ``(steps, warnings)``.
+    """
+    warnings = []
+    nodes_data = data.get("nodes") or []
+    edges_data = data.get("edges") or []
+    if not isinstance(nodes_data, list):
+        return [], ["Graph file has invalid 'nodes'."]
+
+    ordered_ids = []
+    by_id = {}
+    for i, nd in enumerate(nodes_data):
+        if not isinstance(nd, dict):
+            continue
+        nid = nd.get("id", f"n{i}")
+        if nid in by_id:
+            continue
+        by_id[nid] = nd
+        ordered_ids.append(nid)
+
+    indeg = {nid: 0 for nid in ordered_ids}
+    outgoing = {nid: [] for nid in ordered_ids}
+    for ed in edges_data if isinstance(edges_data, list) else []:
+        if not isinstance(ed, dict):
+            continue
+        s, d = ed.get("src_id"), ed.get("dst_id")
+        if s in by_id and d in by_id:
+            outgoing[s].append(d)
+            indeg[d] += 1
+
+    # Kahn topological sort; seed queue in file order for a stable result.
+    queue = [nid for nid in ordered_ids if indeg[nid] == 0]
+    order = []
+    while queue:
+        nid = queue.pop(0)
+        order.append(nid)
+        for nxt in outgoing[nid]:
+            indeg[nxt] -= 1
+            if indeg[nxt] == 0:
+                queue.append(nxt)
+    if len(order) != len(ordered_ids):
+        warnings.append(
+            "Graph is not a simple chain (branch/cycle/island); "
+            "steps were imported in file order."
+        )
+        order = list(ordered_ids)
+
+    steps = [_strip_step_payload(by_id[nid]) for nid in order]
+    return steps, warnings
+
+
+def steps_to_graph_data(steps):
+    """Build a ``flow_graph`` payload (linear chain) from a step list.
+
+    Lays the steps out top-to-bottom and wires them as a single chain so a
+    flow-designer file opens cleanly in the node view. Returns a dict shaped
+    like a saved graph file.
+    """
+    nodes_out = []
+    edges_out = []
+    for i, s in enumerate(steps):
+        if not isinstance(s, dict):
+            continue
+        entry = {"id": f"n{i}", "x": 60.0, "y": float(i * 90)}
+        entry.update(_strip_step_payload(s))
+        nodes_out.append(entry)
+    for i in range(len(nodes_out) - 1):
+        edges_out.append(
+            {"src_id": nodes_out[i]["id"], "dst_id": nodes_out[i + 1]["id"]}
+        )
+    return {"version": 1, "type": "flow_graph",
+            "nodes": nodes_out, "edges": edges_out}
+
+
 ACCENT = QtGui.QColor(0, 168, 232)  # modern cyan
 
 
@@ -1159,38 +1272,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.syringe_status_label.setStyleSheet("color: #c8c8d8; font-size: 9pt;")
         s_layout.addWidget(self.syringe_status_label, 8, 1, 1, 3)
 
-        self.syringe_adv_group = QtWidgets.QGroupBox(
-            "Syringe advanced — microstep & 16-bit position (uProcess API)"
-        )
-        left_layout.addWidget(self.syringe_adv_group)
-        ag = QtWidgets.QGridLayout(self.syringe_adv_group)
-        ag.addWidget(QtWidgets.QLabel("Microstep direction:"), 0, 0)
-        self.micro_dir_combo = QtWidgets.QComboBox()
-        self.micro_dir_combo.addItem("Pull in (into syringe)", False)
-        self.micro_dir_combo.addItem("Push out (dispense)", True)
-        self.micro_dir_combo.setToolTip("CmdSetStepDirection — then repeated CmdMicrostep.")
-        ag.addWidget(self.micro_dir_combo, 0, 1)
-        ag.addWidget(QtWidgets.QLabel("Step count:"), 0, 2)
-        self.microstep_count_spin = QtWidgets.QSpinBox()
-        self.microstep_count_spin.setRange(1, 20000)
-        self.microstep_count_spin.setValue(10)
-        ag.addWidget(self.microstep_count_spin, 0, 3)
-        self.microstep_run_btn = QtWidgets.QPushButton("Run microsteps → CmdStop (release windings)")
-        self.microstep_run_btn.setToolTip(
-            "Calls CmdSetStepDirection, CmdMicrostep ×N, then CmdStop (required to idle motor)."
-        )
-        ag.addWidget(self.microstep_run_btn, 1, 0, 1, 4)
-        ag.addWidget(
-            QtWidgets.QLabel("Motor position 0–65535 (CmdMoveToPosition, not µL):"), 2, 0, 1, 2
-        )
-        self.position16_spin = QtWidgets.QSpinBox()
-        self.position16_spin.setRange(0, 65535)
-        ag.addWidget(self.position16_spin, 2, 2)
-        self.move_position_btn = QtWidgets.QPushButton("CmdMoveToPosition")
-        self.move_position_btn.setToolTip("16-bit encoder/position target per uProcess binding.")
-        ag.addWidget(self.move_position_btn, 2, 3)
-
-        # Manifold control
+        # Manifold control (4VM) — single consolidated panel.
+        # Each valve is a dropdown with its four native CmdSetValves codes; one
+        # "Switch valves" button applies all four valves at once.
         self.manifold_group = QtWidgets.QGroupBox("Manifold Control (4VM)")
         left_layout.addWidget(self.manifold_group)
         m_layout = QtWidgets.QGridLayout(self.manifold_group)
@@ -1204,43 +1288,32 @@ class MainWindow(QtWidgets.QMainWindow):
         self.manifold_info_label.setStyleSheet("color: #a8a8b8; font-size: 10pt;")
         m_layout.addWidget(self.manifold_info_label, 1, 0, 1, 4)
 
-        self.v1_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
-        self.v2_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
-        self.v3_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
-        self.v4_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
-        self._valve_sliders = [
-            self.v1_slider, self.v2_slider, self.v3_slider, self.v4_slider
+        valve_hint = QtWidgets.QLabel(
+            "Set each valve, then Switch valves "
+            "(0 No change · 1 Position A · 2 Closed · 3 Position B)."
+        )
+        valve_hint.setWordWrap(True)
+        valve_hint.setStyleSheet("color: #a8a8b8; font-size: 9pt;")
+        m_layout.addWidget(valve_hint, 2, 0, 1, 4)
+
+        # (label, native CmdSetValves code) per dropdown entry.
+        valve_options = [
+            ("No change", 0),
+            ("Position A", 1),
+            ("Closed", 2),
+            ("Position B", 3),
         ]
-        self._valve_value_labels = []
-        # One slider per row — four in a single grid row were ~80px wide each and often
-        # unusable in the narrow left column (hard to drag / no hit target).
-        for idx, sl in enumerate(self._valve_sliders, start=1):
-            sl.setRange(0, 1)
-            sl.setSingleStep(1)
-            sl.setPageStep(1)
-            sl.setTracking(True)
-            sl.setMaximumHeight(32)
-            sl.setMinimumWidth(180)
-            sl.setSizePolicy(
-                QtWidgets.QSizePolicy.Policy.Expanding,
-                QtWidgets.QSizePolicy.Policy.Fixed,
-            )
-            sl.setToolTip(
-                f"V{idx} quick: 0/1 passed to CmdSetValves (0=no change, 1=position A). "
-                f"For codes 2=closed, 3=B use “4VM native” below."
-            )
-            value_label = QtWidgets.QLabel()
-            value_label.setMinimumWidth(96)
-            value_label.setStyleSheet("color: #c8c8d8; font-size: 9pt;")
-            self._valve_value_labels.append(value_label)
-            sl.valueChanged.connect(
-                lambda _v, i=idx - 1: self._update_valve_value_label(i)
-            )
-            row = 1 + idx
-            m_layout.addWidget(QtWidgets.QLabel(f"V{idx}:"), row, 0)
-            m_layout.addWidget(sl, row, 1, 1, 2)
-            m_layout.addWidget(value_label, row, 3)
-            self._update_valve_value_label(idx - 1)
+        self.native_v_combos = []
+        for i in range(4):
+            combo = QtWidgets.QComboBox()
+            for label, code in valve_options:
+                combo.addItem(f"{code} — {label}", code)
+            combo.setCurrentIndex(0)
+            combo.setToolTip(f"Target position for valve V{i + 1}.")
+            self.native_v_combos.append(combo)
+            row = 3 + i
+            m_layout.addWidget(QtWidgets.QLabel(f"V{i + 1}:"), row, 0)
+            m_layout.addWidget(combo, row, 1, 1, 3)
 
         self.switch_btn = QtWidgets.QToolButton()
         self.switch_btn.setText("Switch valves")
@@ -1249,9 +1322,7 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self.switch_btn.setFixedSize(150, 36)
         self.switch_btn.setCursor(QtGui.QCursor(QtCore.Qt.CursorShape.PointingHandCursor))
-        self.switch_btn.setToolTip("Apply the V1–V4 quick codes above to the manifold.")
-        # A plain, solid, fixed-size button. Its visible area == its click area
-        # (no gradient/stretched grid span), so taps land reliably.
+        self.switch_btn.setToolTip("Apply all four valve positions at once (CmdSetValves).")
         self.switch_btn.setStyleSheet(
             "QToolButton {"
             " background-color: #00a8e8; color: #ffffff; font-weight: 600;"
@@ -1259,9 +1330,6 @@ class MainWindow(QtWidgets.QMainWindow):
             "QToolButton:hover { background-color: #19b6f5; }"
             "QToolButton:pressed { background-color: #0079ad; }"
         )
-        # Center a compact, fixed-size button in its own row instead of
-        # stretching it across all four grid columns (which made it a very wide
-        # click target that was awkward to aim at).
         switch_btn_row = QtWidgets.QHBoxLayout()
         switch_btn_row.setContentsMargins(0, 6, 0, 6)
         switch_btn_row.addStretch(1)
@@ -1269,49 +1337,33 @@ class MainWindow(QtWidgets.QMainWindow):
             self.switch_btn, 0, QtCore.Qt.AlignmentFlag.AlignCenter
         )
         switch_btn_row.addStretch(1)
-        m_layout.addLayout(switch_btn_row, 6, 0, 1, 4)
+        m_layout.addLayout(switch_btn_row, 7, 0, 1, 4)
 
         self.manifold_status_label = QtWidgets.QLabel("—")
         self.manifold_status_label.setWordWrap(True)
         self.manifold_status_label.setStyleSheet("color: #c8c8d8; font-size: 9pt;")
-        m_layout.addWidget(self.manifold_status_label, 7, 0, 1, 4)
+        m_layout.addWidget(self.manifold_status_label, 8, 0, 1, 4)
 
-        self.manifold_adv_group = QtWidgets.QGroupBox(
-            "4VM native — CmdSetValves / CmdSetValveMotion"
+        sep = QtWidgets.QFrame()
+        sep.setFrameShape(QtWidgets.QFrame.Shape.HLine)
+        sep.setFrameShadow(QtWidgets.QFrame.Shadow.Sunken)
+        m_layout.addWidget(sep, 9, 0, 1, 4)
+
+        m_layout.addWidget(
+            QtWidgets.QLabel("Single-valve motion (CmdSetValveMotion):"), 10, 0, 1, 4
         )
-        left_layout.addWidget(self.manifold_adv_group)
-        mg = QtWidgets.QGridLayout(self.manifold_adv_group)
-        mg.addWidget(
-            QtWidgets.QLabel(
-                "CmdSetValves codes: 0=no change, 1=position A, 2=closed, 3=position B"
-            ),
-            0,
-            0,
-            1,
-            8,
-        )
-        self.native_v_spins = []
-        for i in range(4):
-            sp = QtWidgets.QSpinBox()
-            sp.setRange(0, 3)
-            sp.setValue(0)
-            self.native_v_spins.append(sp)
-            mg.addWidget(QtWidgets.QLabel(f"V{i + 1}:"), 1, i * 2)
-            mg.addWidget(sp, 1, i * 2 + 1)
-        self.native_valves_btn = QtWidgets.QPushButton("Apply CmdSetValves (native 0–3)")
-        mg.addWidget(self.native_valves_btn, 2, 0, 1, 8)
-        mg.addWidget(QtWidgets.QLabel("CmdSetValveMotion — valve #"), 3, 0)
+        m_layout.addWidget(QtWidgets.QLabel("Valve #"), 11, 0)
         self.motion_valve_spin = QtWidgets.QSpinBox()
         self.motion_valve_spin.setRange(1, 4)
         self.motion_valve_spin.setValue(1)
-        mg.addWidget(self.motion_valve_spin, 3, 1)
-        mg.addWidget(QtWidgets.QLabel("motion code"), 3, 2)
-        self.motion_code_spin = QtWidgets.QSpinBox()
-        self.motion_code_spin.setRange(0, 3)
-        self.motion_code_spin.setValue(1)
-        mg.addWidget(self.motion_code_spin, 3, 3)
+        m_layout.addWidget(self.motion_valve_spin, 11, 1)
+        self.motion_code_combo = QtWidgets.QComboBox()
+        for label, code in valve_options:
+            self.motion_code_combo.addItem(f"{code} — {label}", code)
+        self.motion_code_combo.setCurrentIndex(1)
+        m_layout.addWidget(self.motion_code_combo, 11, 2, 1, 2)
         self.motion_one_btn = QtWidgets.QPushButton("Apply single-valve motion")
-        mg.addWidget(self.motion_one_btn, 4, 0, 1, 8)
+        m_layout.addWidget(self.motion_one_btn, 12, 0, 1, 4)
 
         # Log area
         log_header = QtWidgets.QHBoxLayout()
@@ -1350,7 +1402,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.stop_syringe_btn.clicked.connect(self._on_stop_syringe)
         self.stop_board_btn.clicked.connect(self._on_stop_board)
         self.reset_syringe_state_btn.clicked.connect(self._on_reset_syringe_state)
-        self.switch_btn.clicked.connect(self._on_switch)
+        self.switch_btn.clicked.connect(self._on_native_cmd_set_valves)
         self.clear_log_btn.clicked.connect(self.log_edit.clear)
         self.open_logs_btn.clicked.connect(self._open_logs_folder)
 
@@ -1362,9 +1414,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._status_timer = QtCore.QTimer(self)
         self._status_timer.setInterval(250)
         self._status_timer.timeout.connect(self._refresh_live_hardware_status)
-        self.microstep_run_btn.clicked.connect(self._on_microstep_run)
-        self.move_position_btn.clicked.connect(self._on_move_to_position16)
-        self.native_valves_btn.clicked.connect(self._on_native_cmd_set_valves)
         self.motion_one_btn.clicked.connect(self._on_cmd_set_valve_motion)
         self.bus_refresh_btn.clicked.connect(self._refresh_bus_modules_panel)
         self.bus_stop_extras_btn.clicked.connect(self._on_stop_bus_extra_modules)
@@ -1806,9 +1855,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self.move_btn,
             self.stop_syringe_btn,
             self.stop_board_btn,
-            self.microstep_run_btn,
-            self.move_position_btn,
-            self.native_valves_btn,
             self.motion_one_btn,
         ):
             w.setEnabled(ok)
@@ -2467,49 +2513,34 @@ class MainWindow(QtWidgets.QMainWindow):
                 self, "Execution error", f"Error resetting syringe state:\n{e}"
             )
 
-    def _update_valve_value_label(self, i: int) -> None:
-        """Show the live 0/1 quick-code next to a valve slider."""
-        labels = getattr(self, "_valve_value_labels", None)
-        sliders = getattr(self, "_valve_sliders", None)
-        if not labels or not sliders or not (0 <= i < len(labels)):
-            return
-        v = sliders[i].value()
-        meaning = "no change" if v == 0 else "position A"
-        labels[i].setText(f"{v}  ({meaning})")
-
     # Manifold actions
-    def _on_switch(self):
+    def _on_native_cmd_set_valves(self):
         if self._board is None:
-            QtWidgets.QMessageBox.warning(self, "Not connected", "Please connect the board first.")
+            QtWidgets.QMessageBox.warning(
+                self, "Not connected", "Please connect the board first."
+            )
             return
-        name = self._manifold_logical_name()
-        if not name:
+        m = self._current_manifold()
+        if m is None:
             QtWidgets.QMessageBox.warning(
                 self,
                 "Error",
-                "No manifold name available. Connect a board (or the Mock board) "
+                "No manifold available. Connect a board (or the Mock board) "
                 "and pick a manifold in the dropdown first.",
             )
             return
-        v1 = self.v1_slider.value()
-        v2 = self.v2_slider.value()
-        v3 = self.v3_slider.value()
-        v4 = self.v4_slider.value()
+        v = [int(c.currentData()) for c in self.native_v_combos]
+        name = self._manifold_logical_name() or "manifold"
         try:
-            idx = self._board.FindIndexM(name)
-            dev = self._board.C4VM[idx]
-            dev.SwitchValves(v1, v2, v3, v4)
+            m.SetValvesNative(v[0], v[1], v[2], v[3])
         except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "Execution error", f"Error switching valves:\n{e}")
+            QtWidgets.QMessageBox.critical(self, "Switch valves", str(e))
             return
 
-        self._append_log(
-            f"{name}: SwitchValves({v1}, {v2}, {v3}, {v4}) sent."
-        )
-        # Give immediate visual feedback even when periodic monitoring is off.
+        self._append_log(f"{name}: CmdSetValves({v[0]}, {v[1]}, {v[2]}, {v[3]}) sent.")
         try:
-            dev.UpdateStatus()
-            vst = getattr(dev, "V_status", None)
+            m.UpdateStatus()
+            vst = getattr(m, "V_status", None)
             if vst is not None:
                 state = ", ".join(
                     str(vst[i]) if i < len(vst) and vst[i] is not None else "?"
@@ -2519,58 +2550,10 @@ class MainWindow(QtWidgets.QMainWindow):
                     f"{name}: valves switched → status [{state}]"
                 )
         except Exception:
-            self.manifold_status_label.setText(f"{name}: SwitchValves sent.")
+            self.manifold_status_label.setText(f"{name}: CmdSetValves sent.")
         self.statusBar().showMessage(
-            f"{name}: valves set to ({v1}, {v2}, {v3}, {v4}).", 4000
+            f"{name}: valves set to ({v[0]}, {v[1]}, {v[2]}, {v[3]}).", 4000
         )
-
-    def _on_microstep_run(self):
-        s = self._current_syringe()
-        if s is None:
-            QtWidgets.QMessageBox.warning(self, "Error", "Select a syringe.")
-            return
-        push = bool(self.micro_dir_combo.currentData())
-        n = self.microstep_count_spin.value()
-        try:
-            if not s.BeginManualMicrostep(push):
-                QtWidgets.QMessageBox.warning(
-                    self, "Microstep", "CmdSetStepDirection returned false."
-                )
-                return
-            s.MicrostepRepeat(n)
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "Microstep", str(e))
-        finally:
-            try:
-                s.Stop()
-            except Exception:
-                pass
-
-    def _on_move_to_position16(self):
-        s = self._current_syringe()
-        if s is None:
-            QtWidgets.QMessageBox.warning(self, "Error", "Select a syringe.")
-            return
-        pos = self.position16_spin.value()
-        try:
-            ok = s.MoveToPosition16(pos)
-            if not ok:
-                QtWidgets.QMessageBox.warning(
-                    self, "Position", "CmdMoveToPosition returned false."
-                )
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "Position", str(e))
-
-    def _on_native_cmd_set_valves(self):
-        m = self._current_manifold()
-        if m is None:
-            QtWidgets.QMessageBox.warning(self, "Error", "Select a manifold.")
-            return
-        v = [sp.value() for sp in self.native_v_spins]
-        try:
-            m.SetValvesNative(v[0], v[1], v[2], v[3])
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "Native valves", str(e))
 
     def _on_cmd_set_valve_motion(self):
         m = self._current_manifold()
@@ -2578,7 +2561,7 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, "Error", "Select a manifold.")
             return
         vi = self.motion_valve_spin.value()
-        code = self.motion_code_spin.value()
+        code = int(self.motion_code_combo.currentData())
         try:
             ok = m.SetSingleValveMotion(vi, code)
             if not ok:
@@ -2955,27 +2938,15 @@ class MainWindow(QtWidgets.QMainWindow):
                 lambda text: self._update_switch_step("manifold", text)
             )
 
-            v1_spin = QtWidgets.QSpinBox()
-            v2_spin = QtWidgets.QSpinBox()
-            v3_spin = QtWidgets.QSpinBox()
-            v4_spin = QtWidgets.QSpinBox()
-            for spin, key in [
-                (v1_spin, "v1"),
-                (v2_spin, "v2"),
-                (v3_spin, "v3"),
-                (v4_spin, "v4"),
-            ]:
-                spin.setRange(0, 1)
-                spin.setValue(int(step.get(key, 0)))
-                spin.valueChanged.connect(
-                    lambda val, k=key: self._update_switch_step(k, val)
-                )
-
             self.param_layout.addRow("Manifold name:", manifold_combo)
-            self.param_layout.addRow("V1:", v1_spin)
-            self.param_layout.addRow("V2:", v2_spin)
-            self.param_layout.addRow("V3:", v3_spin)
-            self.param_layout.addRow("V4:", v4_spin)
+            for key in ("v1", "v2", "v3", "v4"):
+                combo = make_valve_position_combo(int(step.get(key, 0)))
+                combo.currentIndexChanged.connect(
+                    lambda _idx, k=key, c=combo: self._update_switch_step(
+                        k, c.currentData()
+                    )
+                )
+                self.param_layout.addRow(f"{key.upper()}:", combo)
 
         else:
             info = QtWidgets.QLabel("Stop board: call StopBoard() when reaching this step.")
@@ -3306,16 +3277,33 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Load error", f"Invalid JSON file:\n{e}")
             return
-        if not isinstance(data, dict) or data.get("type") != "flow_designer":
+        if not isinstance(data, dict):
             QtWidgets.QMessageBox.warning(
-                self, "Load error", "This file is not a flow designer file."
+                self, "Load error", "This file is not a valid flow file."
+            )
+            return
+        warnings = []
+        file_type = data.get("type")
+        if file_type == "flow_graph":
+            # Cross-format import: linearise a node graph into ordered steps.
+            converted_steps, conv_warnings = graph_data_to_steps(data)
+            data = {
+                "version": data.get("version", 1),
+                "type": "flow_designer",
+                "steps": converted_steps,
+            }
+            warnings.extend(conv_warnings)
+            warnings.append("Imported a Flow Graph file and flattened it to steps.")
+        elif file_type != "flow_designer":
+            QtWidgets.QMessageBox.warning(
+                self, "Load error",
+                "This file is not a flow designer or flow graph file.",
             )
             return
         # Version check. v1 is the only supported format today. A missing
         # version field is tolerated (pre-versioned files) but warned. A
         # version we don't understand is rejected rather than silently
         # misinterpreted as v1.
-        warnings = []
         version = data.get("version")
         if version is None:
             warnings.append("File has no 'version' field; assuming v1.")
@@ -3890,27 +3878,14 @@ class MainWindow(QtWidgets.QMainWindow):
                 lambda text, s=step: self._graph_sidebar_update_switch(s, "manifold", text)
             )
 
-            v1_spin = QtWidgets.QSpinBox()
-            v2_spin = QtWidgets.QSpinBox()
-            v3_spin = QtWidgets.QSpinBox()
-            v4_spin = QtWidgets.QSpinBox()
-            for spin, key in [
-                (v1_spin, "v1"),
-                (v2_spin, "v2"),
-                (v3_spin, "v3"),
-                (v4_spin, "v4"),
-            ]:
-                spin.setRange(0, 1)
-                spin.setValue(int(step.get(key, 0)))
-                spin.valueChanged.connect(
-                    lambda val, k=key, s=step: self._graph_sidebar_update_switch(s, k, val)
-                )
-
             self.graph_param_layout.addRow("Manifold name:", manifold_combo)
-            self.graph_param_layout.addRow("V1:", v1_spin)
-            self.graph_param_layout.addRow("V2:", v2_spin)
-            self.graph_param_layout.addRow("V3:", v3_spin)
-            self.graph_param_layout.addRow("V4:", v4_spin)
+            for key in ("v1", "v2", "v3", "v4"):
+                combo = make_valve_position_combo(int(step.get(key, 0)))
+                combo.currentIndexChanged.connect(
+                    lambda _idx, k=key, s=step, c=combo:
+                        self._graph_sidebar_update_switch(s, k, c.currentData())
+                )
+                self.graph_param_layout.addRow(f"{key.upper()}:", combo)
 
         else:
             info = QtWidgets.QLabel("Stop board: call StopBoard() when reaching this step.")
@@ -4210,12 +4185,29 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Load error", f"Invalid JSON file:\n{e}")
             return
-        if not isinstance(data, dict) or data.get("type") != "flow_graph":
+        if not isinstance(data, dict):
             QtWidgets.QMessageBox.warning(
-                self, "Load error", "This file is not a flow graph file."
+                self, "Load error", "This file is not a valid flow file."
             )
             return
         warnings = []
+        file_type = data.get("type")
+        if file_type == "flow_designer":
+            # Cross-format import: lay a linear step list out as a node chain.
+            steps = data.get("steps")
+            if not isinstance(steps, list):
+                QtWidgets.QMessageBox.warning(
+                    self, "Load error", "Flow designer file has invalid 'steps'."
+                )
+                return
+            data = steps_to_graph_data(steps)
+            warnings.append("Imported a Flow Designer file and laid it out as a chain.")
+        elif file_type != "flow_graph":
+            QtWidgets.QMessageBox.warning(
+                self, "Load error",
+                "This file is not a flow graph or flow designer file.",
+            )
+            return
         version = data.get("version")
         if version is None:
             warnings.append("File has no 'version' field; assuming v1.")
