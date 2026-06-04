@@ -131,9 +131,36 @@ FLOW_COMPONENTS = [
     "Stop board",
 ]
 
+# Control-flow steps are Flow Designer only. The Flow Graph expresses loops with
+# back-pointing edges instead, so its palette stays the plain hardware actions.
+FLOW_CONTROL_COMPONENTS = [
+    "Go to step",
+    "Loop",
+]
+
+FLOW_DESIGNER_COMPONENTS = FLOW_COMPONENTS + FLOW_CONTROL_COMPONENTS
+
 
 def _default_pump_dict() -> dict:
-    return {"syringe": "", "flowrate": 100.0, "volume": 10.0}
+    return {
+        "syringe": "",
+        "flowrate": 100.0,
+        "volume": 10.0,
+        "mode": "relative",
+        "direction": "push_out",
+        "setpoint": 0.0,
+    }
+
+
+def _normalize_pump_mode(value) -> str:
+    return "absolute" if str(value or "").strip().lower() == "absolute" else "relative"
+
+
+def _normalize_pump_direction(value) -> str:
+    v = str(value or "").strip().lower()
+    if v in ("pull_in", "pull in", "aspirate", "in", "false"):
+        return "pull_in"
+    return "push_out"
 
 
 def sync_legacy_move_syringe_mirror(step: dict) -> None:
@@ -143,6 +170,9 @@ def sync_legacy_move_syringe_mirror(step: dict) -> None:
         step.setdefault("syringe", "")
         step.setdefault("flowrate", 100.0)
         step.setdefault("volume", 10.0)
+        step.setdefault("mode", "relative")
+        step.setdefault("direction", "push_out")
+        step.setdefault("setpoint", 0.0)
         step.setdefault("enable_second_syringe", False)
         step.setdefault("syringe_2", "")
         step.setdefault("flowrate_2", 100.0)
@@ -152,16 +182,25 @@ def sync_legacy_move_syringe_mirror(step: dict) -> None:
     step["syringe"] = str(p0.get("syringe", "") or "")
     step["flowrate"] = float(p0.get("flowrate", 100.0))
     step["volume"] = float(p0.get("volume", 10.0))
+    step["mode"] = _normalize_pump_mode(p0.get("mode", "relative"))
+    step["direction"] = _normalize_pump_direction(p0.get("direction", "push_out"))
+    step["setpoint"] = float(p0.get("setpoint", step["volume"]))
     step["enable_second_syringe"] = len(pumps) > 1
     if len(pumps) > 1:
         p1 = pumps[1]
         step["syringe_2"] = str(p1.get("syringe", "") or "")
         step["flowrate_2"] = float(p1.get("flowrate", 100.0))
         step["volume_2"] = float(p1.get("volume", 10.0))
+        step["mode_2"] = _normalize_pump_mode(p1.get("mode", "relative"))
+        step["direction_2"] = _normalize_pump_direction(p1.get("direction", "push_out"))
+        step["setpoint_2"] = float(p1.get("setpoint", step["volume_2"]))
     else:
         step["syringe_2"] = ""
         step["flowrate_2"] = 100.0
         step["volume_2"] = 10.0
+        step["mode_2"] = "relative"
+        step["direction_2"] = "push_out"
+        step["setpoint_2"] = 0.0
 
 
 def migrate_flow_step_inplace(step: dict) -> None:
@@ -194,13 +233,17 @@ def migrate_flow_step_inplace(step: dict) -> None:
             try:
                 fr = float(p.get("flowrate", 100.0))
                 vol = float(p.get("volume", 10.0))
+                sp = float(p.get("setpoint", vol))
             except (TypeError, ValueError):
-                fr, vol = 100.0, 10.0
+                fr, vol, sp = 100.0, 10.0, 10.0
             normed.append(
                 {
                     "syringe": str(p.get("syringe", "") or ""),
                     "flowrate": fr,
                     "volume": vol,
+                    "mode": _normalize_pump_mode(p.get("mode", "relative")),
+                    "direction": _normalize_pump_direction(p.get("direction", "push_out")),
+                    "setpoint": sp,
                 }
             )
         if normed:
@@ -212,26 +255,34 @@ def migrate_flow_step_inplace(step: dict) -> None:
     try:
         fr0 = float(step.get("flowrate", 100.0))
         v0 = float(step.get("volume", 10.0))
+        sp0 = float(step.get("setpoint", v0))
     except (TypeError, ValueError):
-        fr0, v0 = 100.0, 10.0
+        fr0, v0, sp0 = 100.0, 10.0, 10.0
     pumps = [
         {
             "syringe": str(step.get("syringe", "") or ""),
             "flowrate": fr0,
             "volume": v0,
+            "mode": _normalize_pump_mode(step.get("mode", "relative")),
+            "direction": _normalize_pump_direction(step.get("direction", "push_out")),
+            "setpoint": sp0,
         }
     ]
     if step.get("enable_second_syringe"):
         try:
             fr1 = float(step.get("flowrate_2", 100.0))
             v1 = float(step.get("volume_2", 10.0))
+            sp1 = float(step.get("setpoint_2", v1))
         except (TypeError, ValueError):
-            fr1, v1 = 100.0, 10.0
+            fr1, v1, sp1 = 100.0, 10.0, 10.0
         pumps.append(
             {
                 "syringe": str(step.get("syringe_2", "") or ""),
                 "flowrate": fr1,
                 "volume": v1,
+                "mode": _normalize_pump_mode(step.get("mode_2", "relative")),
+                "direction": _normalize_pump_direction(step.get("direction_2", "push_out")),
+                "setpoint": sp1,
             }
         )
     step["pumps"] = pumps[:MOVE_SYRINGE_MAX_PARALLEL_PUMPS]
@@ -280,6 +331,9 @@ FLOW_STEP_DATA_KEYS = (
     "pumps", "enable_second_syringe",
     "syringe_1", "flowrate_1", "volume_1",
     "syringe_2", "flowrate_2", "volume_2",
+    "mode", "direction", "setpoint",
+    "mode_2", "direction_2", "setpoint_2",
+    "target", "count",
 )
 
 
@@ -315,8 +369,18 @@ def graph_data_to_steps(data: dict):
 
     indeg = {nid: 0 for nid in ordered_ids}
     outgoing = {nid: [] for nid in ordered_ids}
+    loop_edges = []
     for ed in edges_data if isinstance(edges_data, list) else []:
         if not isinstance(ed, dict):
+            continue
+        try:
+            loops = int(ed.get("loops", 0) or 0)
+        except (TypeError, ValueError):
+            loops = 0
+        # Loop/back edges aren't part of the linear order; convert them into
+        # Flow Designer "Loop" control steps after the source node.
+        if loops >= 1:
+            loop_edges.append((ed.get("src_id"), ed.get("dst_id"), loops))
             continue
         s, d = ed.get("src_id"), ed.get("dst_id")
         if s in by_id and d in by_id:
@@ -340,7 +404,26 @@ def graph_data_to_steps(data: dict):
         )
         order = list(ordered_ids)
 
-    steps = [_strip_step_payload(by_id[nid]) for nid in order]
+    pos = {nid: i + 1 for i, nid in enumerate(order)}
+    loops_by_src = {}
+    for src, dst, loops in loop_edges:
+        if src not in by_id or dst not in by_id:
+            warnings.append("Graph loop edge skipped during import (unknown source/target).")
+            continue
+        if dst not in pos:
+            warnings.append("Graph loop edge skipped during import (target not in chain order).")
+            continue
+        loops_by_src.setdefault(src, []).append(
+            {"type": "Loop", "target": pos[dst], "count": loops}
+        )
+
+    steps = []
+    for nid in order:
+        steps.append(_strip_step_payload(by_id[nid]))
+        for loop_step in loops_by_src.get(nid, []):
+            steps.append(loop_step)
+    if loop_edges:
+        warnings.append("Converted Flow Graph loop arrows into Flow Designer Loop steps.")
     return steps, warnings
 
 
@@ -351,20 +434,119 @@ def steps_to_graph_data(steps):
     flow-designer file opens cleanly in the node view. Returns a dict shaped
     like a saved graph file.
     """
+    warnings = []
     nodes_out = []
     edges_out = []
+    step_to_node_id = {}
+    last_action_step = None
+    action_types = {"Move syringe", "Wait", "Switch valves", "Stop board"}
+
     for i, s in enumerate(steps):
         if not isinstance(s, dict):
             continue
-        entry = {"id": f"n{i}", "x": 60.0, "y": float(i * 90)}
+        if s.get("type") not in action_types:
+            continue
+        nid = f"n{len(nodes_out)}"
+        entry = {"id": nid, "x": 60.0 + float(len(nodes_out) * 190), "y": 0.0}
         entry.update(_strip_step_payload(s))
         nodes_out.append(entry)
-    for i in range(len(nodes_out) - 1):
+        step_to_node_id[i] = nid
+        last_action_step = i
+
+    def next_action_at_or_after(start_idx: int):
+        for j in range(max(0, start_idx), len(steps)):
+            if j in step_to_node_id:
+                return j
+        return None
+
+    def prev_action_before(start_idx: int):
+        for j in range(min(start_idx - 1, len(steps) - 1), -1, -1):
+            if j in step_to_node_id:
+                return j
+        return None
+
+    explicit_from = set()
+    skipped_node_ids = set()
+    ordered_action_steps = sorted(step_to_node_id)
+    for i, s in enumerate(steps):
+        if not isinstance(s, dict):
+            continue
+        t = s.get("type")
+        if t == "Loop":
+            src_idx = prev_action_before(i)
+            try:
+                target_step = int(s.get("target", 1)) - 1
+                count = int(s.get("count", 1))
+            except (TypeError, ValueError):
+                warnings.append(f"Step {i + 1}: Loop skipped (invalid target/count).")
+                continue
+            dst_idx = next_action_at_or_after(target_step)
+            if src_idx is None or dst_idx is None:
+                warnings.append(
+                    f"Step {i + 1}: Loop skipped (cannot map source/target to graph nodes)."
+                )
+                continue
+            edges_out.append({
+                "src_id": step_to_node_id[src_idx],
+                "dst_id": step_to_node_id[dst_idx],
+                "loops": max(1, count),
+            })
+            warnings.append(f"Step {i + 1}: converted Loop to a graph loop arrow.")
+        elif t == "Go to step":
+            src_idx = prev_action_before(i)
+            try:
+                target_step = int(s.get("target", 1)) - 1
+            except (TypeError, ValueError):
+                warnings.append(f"Step {i + 1}: Go to step skipped (invalid target).")
+                continue
+            dst_idx = next_action_at_or_after(target_step)
+            if src_idx is None or dst_idx is None:
+                warnings.append(
+                    f"Step {i + 1}: Go to step skipped (cannot map source/target to graph nodes)."
+                )
+                continue
+            if dst_idx <= src_idx:
+                warnings.append(
+                    f"Step {i + 1}: backward Go to step is an infinite jump; "
+                    "use a Loop step with a count to represent it in Flow Graph."
+                )
+                continue
+            edges_out.append({
+                "src_id": step_to_node_id[src_idx],
+                "dst_id": step_to_node_id[dst_idx],
+            })
+            explicit_from.add(src_idx)
+            for skipped_idx in ordered_action_steps:
+                if src_idx < skipped_idx < dst_idx:
+                    skipped_node_ids.add(step_to_node_id[skipped_idx])
+            warnings.append(f"Step {i + 1}: converted Go to step to a graph jump edge.")
+
+    # Default forward chain between action nodes, unless a Go-to step after the
+    # source action explicitly overrides where that source should continue.
+    for src_idx, dst_idx in zip(ordered_action_steps, ordered_action_steps[1:]):
+        if src_idx in explicit_from:
+            continue
         edges_out.append(
-            {"src_id": nodes_out[i]["id"], "dst_id": nodes_out[i + 1]["id"]}
+            {"src_id": step_to_node_id[src_idx], "dst_id": step_to_node_id[dst_idx]}
         )
-    return {"version": 1, "type": "flow_graph",
-            "nodes": nodes_out, "edges": edges_out}
+
+    if skipped_node_ids:
+        nodes_out = [n for n in nodes_out if n.get("id") not in skipped_node_ids]
+        edges_out = [
+            e for e in edges_out
+            if e.get("src_id") not in skipped_node_ids and e.get("dst_id") not in skipped_node_ids
+        ]
+        warnings.append(
+            "Removed action nodes skipped by forward Go-to steps so the imported graph remains runnable."
+        )
+
+    return {
+        "version": 1,
+        "type": "flow_graph",
+        "nodes": nodes_out,
+        "edges": edges_out,
+        "warnings": warnings,
+    }
 
 
 ACCENT = QtGui.QColor(0, 168, 232)  # modern cyan
@@ -915,23 +1097,53 @@ class FlowChartView(QtWidgets.QGraphicsView):
 class ArrowEdge(QtWidgets.QGraphicsPathItem):
     """Bezier edge from source out-port to destination in-port, with arrow head and wide hit shape."""
 
-    def __init__(self, src_node: dict, dst_node: dict):
+    NORMAL_COLOR = QtGui.QColor(220, 245, 255)
+    LOOP_COLOR = QtGui.QColor(243, 156, 18)  # orange for back/loop edges
+
+    def __init__(self, src_node: dict, dst_node: dict, loops: int = 0):
         super().__init__()
         self._src_node = src_node
         self._dst_node = dst_node
-        self._arrow_color = QtGui.QColor(220, 245, 255)
+        self._loops = int(loops)
+        self._arrow_color = self.NORMAL_COLOR
         self._curve_path = QtGui.QPainterPath()
         self._head_path = QtGui.QPainterPath()
-        pen = QtGui.QPen(self._arrow_color)
-        pen.setWidth(2)
-        pen.setCapStyle(QtCore.Qt.PenCapStyle.RoundCap)
-        pen.setJoinStyle(QtCore.Qt.PenJoinStyle.RoundJoin)
-        self.setPen(pen)
         # Do not fill the combined curve+head path — Qt would paint a blob between them.
         self.setBrush(QtGui.QBrush(QtCore.Qt.BrushStyle.NoBrush))
         self.setZValue(0)
         self.setFlag(QtWidgets.QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
+        self._apply_style()
         self.update_positions()
+
+    def is_loop(self) -> bool:
+        return self._loops >= 1
+
+    def loops(self) -> int:
+        return self._loops
+
+    def set_loops(self, loops: int) -> None:
+        self._loops = int(loops)
+        self._apply_style()
+        self.update()
+
+    def _apply_style(self) -> None:
+        """Loop edges are drawn orange + dashed so they read as back-jumps."""
+        if self.is_loop():
+            self._arrow_color = self.LOOP_COLOR
+            pen = QtGui.QPen(self._arrow_color)
+            pen.setWidthF(2.6)
+            pen.setStyle(QtCore.Qt.PenStyle.DashLine)
+            # Draw the return arc (and its count badge) above the node row so
+            # the whole loop path is always visible, not hidden behind nodes.
+            self.setZValue(3)
+        else:
+            self._arrow_color = self.NORMAL_COLOR
+            pen = QtGui.QPen(self._arrow_color)
+            pen.setWidth(2)
+            self.setZValue(0)
+        pen.setCapStyle(QtCore.Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(QtCore.Qt.PenJoinStyle.RoundJoin)
+        self.setPen(pen)
 
     def cleanup(self) -> None:
         pass
@@ -950,9 +1162,21 @@ class ArrowEdge(QtWidgets.QGraphicsPathItem):
         if dist < 1e-6:
             return False
 
-        off = max(40.0, min(abs(dx) * 0.35, 140.0))
-        c1 = QtCore.QPointF(p1.x() + off, p1.y())
-        c2 = QtCore.QPointF(p2.x() - off, p2.y())
+        # A back-pointing edge (destination sits left of the source) is routed
+        # as a wide arc that dips below the node row, so it never overlaps the
+        # forward chain and clearly reads as a loop-back.
+        if self.is_loop() or dx < -1.0:
+            span = abs(dx)
+            bow = 80.0 + min(180.0, span * 0.22)
+            base_y = max(p1.y(), p2.y())
+            # Leave the source port heading right, the destination entered from
+            # the left, both pulled well below the nodes.
+            c1 = QtCore.QPointF(p1.x() + 60.0, base_y + bow)
+            c2 = QtCore.QPointF(p2.x() - 60.0, base_y + bow)
+        else:
+            off = max(40.0, min(abs(dx) * 0.35, 140.0))
+            c1 = QtCore.QPointF(p1.x() + off, p1.y())
+            c2 = QtCore.QPointF(p2.x() - off, p2.y())
 
         curve = QtGui.QPainterPath(p1)
         curve.cubicTo(c1, c2, p2)
@@ -1001,7 +1225,9 @@ class ArrowEdge(QtWidgets.QGraphicsPathItem):
         rect = self._curve_path.boundingRect()
         if not self._head_path.isEmpty():
             rect = rect.united(self._head_path.boundingRect())
-        pad = 2.0
+        # Loop edges carry a wide badge at the arc's midpoint; pad generously so
+        # it is never clipped.
+        pad = 60.0 if self.is_loop() else 2.0
         return rect.adjusted(-pad, -pad, pad, pad)
 
     def paint(self, painter: QtGui.QPainter, option, widget=None):
@@ -1015,6 +1241,30 @@ class ArrowEdge(QtWidgets.QGraphicsPathItem):
         if not self._head_path.isEmpty():
             painter.setBrush(QtGui.QBrush(self._arrow_color))
             painter.drawPath(self._head_path)
+        # Loop edges show how many times they jump back, with a prominent badge
+        # pinned to the lowest point of the return arc.
+        if self.is_loop():
+            mid = self._curve_path.pointAtPercent(0.5)
+            label = f"loop: {self._loops}"
+            font = painter.font()
+            font.setBold(True)
+            font.setPointSizeF(max(9.0, font.pointSizeF() + 1.5))
+            painter.setFont(font)
+            metrics = QtGui.QFontMetrics(font)
+            tw = metrics.horizontalAdvance(label)
+            th = metrics.height()
+            pad_x, pad_y = 9.0, 5.0
+            box = QtCore.QRectF(
+                mid.x() - tw / 2 - pad_x, mid.y() - th / 2 - pad_y,
+                tw + 2 * pad_x, th + 2 * pad_y,
+            )
+            # Filled orange pill with dark text for strong contrast.
+            painter.setPen(QtGui.QPen(QtGui.QColor(20, 14, 6), 1.0))
+            painter.setBrush(QtGui.QBrush(self.LOOP_COLOR))
+            painter.drawRoundedRect(box, box.height() / 2.0, box.height() / 2.0)
+            painter.setPen(QtGui.QPen(QtGui.QColor(25, 17, 6)))
+            painter.setBrush(QtCore.Qt.BrushStyle.NoBrush)
+            painter.drawText(box, QtCore.Qt.AlignmentFlag.AlignCenter, label)
 
     def shape(self) -> QtGui.QPainterPath:
         if self._curve_path.isEmpty():
@@ -1537,7 +1787,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.stop_board_btn.clicked.connect(self._on_stop_board)
         self.reset_syringe_state_btn.clicked.connect(self._on_reset_syringe_state)
         self.switch_btn.clicked.connect(self._on_native_cmd_set_valves)
-        self.clear_log_btn.clicked.connect(self.log_edit.clear)
+        self.clear_log_btn.clicked.connect(self._clear_visible_logs)
         self.open_logs_btn.clicked.connect(self._open_logs_folder)
 
         self._setup_menubar()
@@ -1590,7 +1840,7 @@ class MainWindow(QtWidgets.QMainWindow):
         view_m = mb.addMenu("&View")
         act_clear = QtGui.QAction("&Clear log view", self)
         act_clear.setShortcut("Ctrl+L")
-        act_clear.triggered.connect(self.log_edit.clear)
+        act_clear.triggered.connect(self._clear_visible_logs)
         view_m.addAction(act_clear)
         act_ports = QtGui.QAction("&Refresh serial ports", self)
         act_ports.setShortcut("F5")
@@ -1711,6 +1961,24 @@ class MainWindow(QtWidgets.QMainWindow):
             or getattr(self._board, "Stop", False)
         )
 
+    def _terminate_current_run(self):
+        """Cooperatively cancel the current Flow Designer / Flow Graph run."""
+        if self._board is None:
+            return
+        try:
+            self._board.cancel_requested = True
+            self._board.Stop = True
+        except Exception:
+            pass
+        try:
+            self._board.StopBoard()
+        except Exception as e:
+            # The flags above still let the GUI-side execution loop unwind even
+            # if StopBoard itself fails or the mock board does not implement it.
+            self._append_log(f"Terminate: StopBoard failed: {e}")
+        self._set_busy_message("Terminating run…")
+        self.statusBar().showMessage("Terminate requested; waiting for current hardware call to return.", 4000)
+
     def _connected_device_entries(self) -> list:
         return _board_connected_devices(self._board)
 
@@ -1747,11 +2015,15 @@ class MainWindow(QtWidgets.QMainWindow):
         if not (0 <= pump_index < len(pumps)):
             return False
         p = pumps[pump_index]
-        if field in ("flowrate", "volume"):
+        if field in ("flowrate", "volume", "setpoint"):
             try:
                 p[field] = float(value)
             except (TypeError, ValueError):
                 return False
+        elif field == "mode":
+            p["mode"] = _normalize_pump_mode(value)
+        elif field == "direction":
+            p["direction"] = _normalize_pump_direction(value)
         elif field == "syringe":
             p["syringe"] = str(value or "")
         else:
@@ -1829,8 +2101,9 @@ class MainWindow(QtWidgets.QMainWindow):
         """Move syringe: 1–N parallel pumps (N ≤ MoveParallel limit)."""
         migrate_flow_step_inplace(step)
         hint = QtWidgets.QLabel(
-            f"Add parallel pumps to run them together in this step (up to "
-            f"{MOVE_SYRINGE_MAX_PARALLEL_PUMPS}). Each pump can have its own flow rate and volume."
+            f"Add pumps to run them together in this step (up to "
+            f"{MOVE_SYRINGE_MAX_PARALLEL_PUMPS}). Each pump follows the same "
+            "Manual Control modes: Flow + Amount (push/pull) or Set point."
         )
         hint.setWordWrap(True)
         layout.addRow(hint)
@@ -1869,6 +2142,29 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             flow_edit = QtWidgets.QLineEdit(str(pump.get("flowrate", 100.0)))
             vol_edit = QtWidgets.QLineEdit(str(pump.get("volume", 10.0)))
+            setpoint_edit = QtWidgets.QLineEdit(str(pump.get("setpoint", pump.get("volume", 0.0))))
+            mode_combo = QtWidgets.QComboBox()
+            mode_combo.addItem("Flow + Amount", "relative")
+            mode_combo.addItem("Set point", "absolute")
+            mode_combo.setCurrentIndex(1 if _normalize_pump_mode(pump.get("mode")) == "absolute" else 0)
+            direction_combo = QtWidgets.QComboBox()
+            direction_combo.addItem("Push out (dispense)", "push_out")
+            direction_combo.addItem("Pull in (aspirate)", "pull_in")
+            direction_combo.setCurrentIndex(
+                1 if _normalize_pump_direction(pump.get("direction")) == "pull_in" else 0
+            )
+            mode_combo.currentIndexChanged.connect(
+                lambda _idx, st=step, ii=idx, c=mode_combo, fl=for_flow_table: (
+                    self._set_move_syringe_pump_field(st, ii, "mode", c.currentData())
+                    and (self._after_move_syringe_flow_edit(st) if fl else self._after_move_syringe_sidebar_edit(st))
+                )
+            )
+            direction_combo.currentIndexChanged.connect(
+                lambda _idx, st=step, ii=idx, c=direction_combo, fl=for_flow_table: (
+                    self._set_move_syringe_pump_field(st, ii, "direction", c.currentData())
+                    and (self._after_move_syringe_flow_edit(st) if fl else self._after_move_syringe_sidebar_edit(st))
+                )
+            )
             if for_flow_table:
                 flow_edit.editingFinished.connect(
                     lambda fe=flow_edit, st=step, ii=idx: self._finish_move_syringe_pump_line_edit(
@@ -1878,6 +2174,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 vol_edit.editingFinished.connect(
                     lambda ve=vol_edit, st=step, ii=idx: self._finish_move_syringe_pump_line_edit(
                         st, ii, "volume", ve.text(), flow=True
+                    )
+                )
+                setpoint_edit.editingFinished.connect(
+                    lambda se=setpoint_edit, st=step, ii=idx: self._finish_move_syringe_pump_line_edit(
+                        st, ii, "setpoint", se.text(), flow=True
                     )
                 )
             else:
@@ -1891,9 +2192,38 @@ class MainWindow(QtWidgets.QMainWindow):
                         st, ii, "volume", ve.text(), flow=False
                     )
                 )
+                setpoint_edit.editingFinished.connect(
+                    lambda se=setpoint_edit, st=step, ii=idx: self._finish_move_syringe_pump_line_edit(
+                        st, ii, "setpoint", se.text(), flow=False
+                    )
+                )
+            direction_label = QtWidgets.QLabel(f"Direction {idx + 1}:")
+            amount_label = QtWidgets.QLabel(f"Amount {idx + 1} (µL):")
+            setpoint_label = QtWidgets.QLabel(f"Set point {idx + 1} (µL):")
+
+            def sync_mode_visibility(
+                combo=mode_combo,
+                dlab=direction_label,
+                dfield=direction_combo,
+                alab=amount_label,
+                afield=vol_edit,
+                slab=setpoint_label,
+                sfield=setpoint_edit,
+            ):
+                absolute = combo.currentData() == "absolute"
+                for w in (dlab, dfield, alab, afield):
+                    w.setVisible(not absolute)
+                for w in (slab, sfield):
+                    w.setVisible(absolute)
+
+            mode_combo.currentIndexChanged.connect(lambda _idx, fn=sync_mode_visibility: fn())
             layout.addRow(f"Syringe {idx + 1}:", syringe_combo)
+            layout.addRow(f"Move mode {idx + 1}:", mode_combo)
             layout.addRow(f"Flowrate {idx + 1} (µL/min):", flow_edit)
-            layout.addRow(f"Volume {idx + 1} (µL):", vol_edit)
+            layout.addRow(direction_label, direction_combo)
+            layout.addRow(amount_label, vol_edit)
+            layout.addRow(setpoint_label, setpoint_edit)
+            sync_mode_visibility()
 
     def _finish_move_syringe_pump_line_edit(
         self,
@@ -1957,10 +2287,36 @@ class MainWindow(QtWidgets.QMainWindow):
             self._build_param_editor_for_step(step)
 
     # Log
-    def _append_log(self, line: str):
-        self.log_edit.appendPlainText(line)
-        sb = self.log_edit.verticalScrollBar()
+    def _make_embedded_log_view(self, placeholder: str) -> QtWidgets.QPlainTextEdit:
+        """Compact read-only log view used in Flow Designer / Flow Graph sidebars."""
+        edit = QtWidgets.QPlainTextEdit()
+        edit.setReadOnly(True)
+        edit.setPlaceholderText(placeholder)
+        edit.setMaximumBlockCount(3000)
+        edit.setMinimumHeight(140)
+        edit.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Expanding,
+        )
+        return edit
+
+    def _append_line_to_log_view(self, edit: QtWidgets.QPlainTextEdit, line: str) -> None:
+        edit.appendPlainText(line)
+        sb = edit.verticalScrollBar()
         sb.setValue(sb.maximum())
+
+    def _append_log(self, line: str):
+        for attr in ("log_edit", "flow_log_edit", "graph_log_edit"):
+            edit = getattr(self, attr, None)
+            if edit is not None:
+                self._append_line_to_log_view(edit, line)
+
+    def _clear_visible_logs(self):
+        """Clear all on-screen log panes without deleting OUTPUT.txt on disk."""
+        for attr in ("log_edit", "flow_log_edit", "graph_log_edit"):
+            edit = getattr(self, attr, None)
+            if edit is not None:
+                edit.clear()
 
     def _sync_connection_ui(self):
         """COM row follows link state; hardware *actions* only when connected.
@@ -2008,7 +2364,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.bus_refresh_btn.setEnabled(ok)
         self.bus_stop_extras_btn.setEnabled(ok)
         self.run_flow_btn.setEnabled(ok)
+        if hasattr(self, "terminate_flow_btn"):
+            self.terminate_flow_btn.setEnabled(ok)
         self.graph_run_btn.setEnabled(ok)
+        if hasattr(self, "graph_terminate_btn"):
+            self.graph_terminate_btn.setEnabled(ok)
         self._refresh_conn_badge()
 
     def _update_status_bar(self):
@@ -2074,32 +2434,87 @@ class MainWindow(QtWidgets.QMainWindow):
         self.graph_scene.removeItem(rec["item"])
         self.graph_edges.remove(rec)
 
-    def _graph_create_edge(self, src_node: dict, dst_node: dict) -> None:
-        """Single-chain mode: at most one out per node, one in per node; new wire replaces old."""
+    def _graph_create_edge(self, src_node: dict, dst_node: dict, loops: int = 0) -> Optional[dict]:
+        """Create an edge between two nodes.
+
+        Forward edges (``loops == 0``) keep the single-chain rule: at most one
+        out per node and one in per node, so a new wire replaces the old. Loop
+        edges (``loops >= 1``) point back to an earlier node, carry a repeat
+        count, and are excluded from the chain so they don't break that rule.
+        """
         if src_node is dst_node:
-            return
+            return None
+        loops = int(loops)
+        if loops >= 1:
+            # Reuse an existing loop edge between the same nodes if present.
+            for rec in self.graph_edges:
+                if (rec.get("loops", 0) >= 1
+                        and rec["src"] is src_node and rec["dst"] is dst_node):
+                    rec["loops"] = loops
+                    rec["item"].set_loops(loops)
+                    return rec
+            edge = ArrowEdge(src_node, dst_node, loops=loops)
+            self.graph_scene.addItem(edge)
+            rec = {
+                "id": next(self._graph_edge_counter),
+                "src": src_node,
+                "dst": dst_node,
+                "item": edge,
+                "loops": loops,
+            }
+            self.graph_edges.append(rec)
+            return rec
+
+        # Forward chain edge: replace any existing forward wire on either side.
         for r in list(src_node.get("outgoing", [])):
             self._graph_remove_edge_record(r)
         for r in list(dst_node.get("incoming", [])):
             self._graph_remove_edge_record(r)
-        edge = ArrowEdge(src_node, dst_node)
+        edge = ArrowEdge(src_node, dst_node, loops=0)
         self.graph_scene.addItem(edge)
         rec = {
             "id": next(self._graph_edge_counter),
             "src": src_node,
             "dst": dst_node,
             "item": edge,
+            "loops": 0,
         }
         src_node.setdefault("outgoing", []).append(rec)
         dst_node.setdefault("incoming", []).append(rec)
         self.graph_edges.append(rec)
+        return rec
+
+    def _graph_edge_is_backward(self, src_n: dict, dst_n: dict) -> bool:
+        """True if the destination's input port sits left of the source's output
+        port — i.e. the arrow points back toward an earlier node."""
+        try:
+            sx = src_n["out_port"].sceneBoundingRect().center().x()
+            dx = dst_n["in_port"].sceneBoundingRect().center().x()
+            return dx < sx - 1.0
+        except Exception:
+            return False
 
     def _on_graph_connection_requested(self, src_rect: GraphNodeItem, dst_rect: GraphNodeItem):
         src_n = self._graph_node_dict_from_rect(src_rect)
         dst_n = self._graph_node_dict_from_rect(dst_rect)
         if src_n is None or dst_n is None:
             return
-        self._graph_create_edge(src_n, dst_n)
+        # Any arrow drawn back toward an earlier node is a loop-back: ask how
+        # many times it should repeat.
+        backward = self._graph_edge_is_backward(src_n, dst_n)
+        loops = 0
+        if backward:
+            n, ok = QtWidgets.QInputDialog.getInt(
+                self, "Loop connection",
+                "This arrow points back to an earlier node.\n"
+                "How many times should it loop back?",
+                1, 1, 100000, 1,
+            )
+            if not ok:
+                return
+            loops = int(n)
+        self._graph_create_edge(src_n, dst_n, loops=loops)
+        self._graph_update_scene_extent()
 
     def _validate_graph_for_run(self) -> None:
         """Raise ValueError with a readable message if the graph cannot run as a single chain."""
@@ -2120,7 +2535,8 @@ class MainWindow(QtWidgets.QMainWindow):
                     "Single-chain mode allows at most one wire from each node."
                 )
         n = len(nodes)
-        m = len(self.graph_edges)
+        # Loop (back-jump) edges are excluded from the forward-chain accounting.
+        m = sum(1 for rec in self.graph_edges if rec.get("loops", 0) == 0)
         if n == 1:
             return
         if m == 0:
@@ -2152,6 +2568,9 @@ class MainWindow(QtWidgets.QMainWindow):
         indeg = {id(n): 0 for n in nodes}
         outgoing = {id(n): [] for n in nodes}
         for rec in self.graph_edges:
+            # Loop/back edges don't define forward execution order.
+            if rec.get("loops", 0) >= 1:
+                continue
             s, d = rec["src"], rec["dst"]
             if id(s) not in node_id_set or id(d) not in node_id_set:
                 continue
@@ -3001,7 +3420,7 @@ class MainWindow(QtWidgets.QMainWindow):
         left_box = QtWidgets.QGroupBox("Components")
         left_layout = QtWidgets.QVBoxLayout(left_box)
         self.flow_components_list = QtWidgets.QListWidget()
-        self.flow_components_list.addItems(FLOW_COMPONENTS)
+        self.flow_components_list.addItems(FLOW_DESIGNER_COMPONENTS)
         if self.flow_components_list.count() > 0:
             self.flow_components_list.setCurrentRow(0)
         left_layout.addWidget(self.flow_components_list)
@@ -3029,6 +3448,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.save_flow_btn = QtWidgets.QPushButton("Save flow")
         self.load_flow_btn = QtWidgets.QPushButton("Load flow")
         self.run_flow_btn = QtWidgets.QPushButton("Run flow")
+        self.terminate_flow_btn = QtWidgets.QPushButton("Terminate")
+        self.terminate_flow_btn.setToolTip("Cancel the currently running Flow Designer protocol.")
         btn_layout.addWidget(self.remove_step_btn)
         btn_layout.addWidget(self.autodetect_flow_modules_btn)
         btn_layout.addWidget(self.run_selected_step_btn)
@@ -3036,6 +3457,7 @@ class MainWindow(QtWidgets.QMainWindow):
         btn_layout.addWidget(self.load_flow_btn)
         btn_layout.addStretch()
         btn_layout.addWidget(self.run_flow_btn)
+        btn_layout.addWidget(self.terminate_flow_btn)
         center_layout.addLayout(btn_layout)
 
         # Right: parameter editor (table row selection). Same step dict shape as graph nodes; data is separate
@@ -3049,7 +3471,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.param_container = QtWidgets.QWidget()
         self.param_layout = QtWidgets.QFormLayout(self.param_container)
         right_layout.addWidget(self.param_container)
-        right_layout.addStretch()
+        right_layout.addWidget(QtWidgets.QLabel("Run log:"))
+        self.flow_log_edit = self._make_embedded_log_view(
+            "Flow Designer run messages appear here…"
+        )
+        right_layout.addWidget(self.flow_log_edit, 1)
 
         # Add three panels to main layout
         layout.addWidget(left_box, 1)
@@ -3062,6 +3488,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.autodetect_flow_modules_btn.clicked.connect(self._on_flow_autodetect_modules)
         self.run_selected_step_btn.clicked.connect(self._on_run_selected_flow_step)
         self.run_flow_btn.clicked.connect(self._on_run_flow)
+        self.terminate_flow_btn.clicked.connect(self._terminate_current_run)
         self.save_flow_btn.clicked.connect(self._on_save_flow)
         self.load_flow_btn.clicked.connect(self._on_load_flow)
         self.flow_table.selectionModel().selectionChanged.connect(self._on_flow_selection_changed)
@@ -3112,6 +3539,17 @@ class MainWindow(QtWidgets.QMainWindow):
                 "v3": 0,
                 "v4": 0,
             }
+        elif step_type == "Go to step":
+            step = {
+                "type": "Go to step",
+                "target": 1,
+            }
+        elif step_type == "Loop":
+            step = {
+                "type": "Loop",
+                "target": 1,
+                "count": 1,
+            }
         else:
             step = {
                 "type": "Stop board",
@@ -3157,11 +3595,16 @@ class MainWindow(QtWidgets.QMainWindow):
         if t == "Move syringe":
             migrate_flow_step_inplace(step)
             pumps = step.get("pumps") or []
-            parts = [
-                f"{p.get('syringe', '')}: {p.get('flowrate', '')} µL/min, "
-                f"{p.get('volume', '')} µL"
-                for p in pumps
-            ]
+            parts = []
+            for p in pumps:
+                if _normalize_pump_mode(p.get("mode")) == "absolute":
+                    action = f"to {p.get('setpoint', 0)} µL"
+                else:
+                    direction = "push" if _normalize_pump_direction(p.get("direction")) == "push_out" else "pull"
+                    action = f"{direction} {p.get('volume', '')} µL"
+                parts.append(
+                    f"{p.get('syringe', '')}: {p.get('flowrate', '')} µL/min, {action}"
+                )
             line = "  ||  ".join(parts) if parts else ""
             if len(pumps) > 1:
                 line += " (parallel)"
@@ -3170,6 +3613,13 @@ class MainWindow(QtWidgets.QMainWindow):
             return f"Wait {step.get('seconds', '')} s"
         if t == "Switch valves":
             return f"{step.get('manifold', '')}: V=({step.get('v1', 0)},{step.get('v2', 0)},{step.get('v3', 0)},{step.get('v4', 0)})"
+        if t == "Go to step":
+            return f"Go to step {step.get('target', 1)}"
+        if t == "Loop":
+            return (
+                f"Loop back to step {step.get('target', 1)} "
+                f"× {step.get('count', 1)}"
+            )
         if t == "Stop board":
             return "Stop board"
         return ""
@@ -3268,6 +3718,37 @@ class MainWindow(QtWidgets.QMainWindow):
                 )
                 self.param_layout.addRow(f"{key.upper()}:", combo)
 
+        elif t == "Go to step":
+            target_spin = QtWidgets.QSpinBox()
+            target_spin.setRange(1, max(1, len(self.flow_steps)))
+            target_spin.setValue(int(step.get("target", 1)))
+            target_spin.setToolTip("Jump unconditionally to this step number (1-based).")
+            target_spin.valueChanged.connect(
+                lambda v: self._update_control_step("target", int(v))
+            )
+            self.param_layout.addRow("Go to step #:", target_spin)
+
+        elif t == "Loop":
+            target_spin = QtWidgets.QSpinBox()
+            target_spin.setRange(1, max(1, len(self.flow_steps)))
+            target_spin.setValue(int(step.get("target", 1)))
+            target_spin.setToolTip("Step number to jump back to when looping (1-based).")
+            target_spin.valueChanged.connect(
+                lambda v: self._update_control_step("target", int(v))
+            )
+            count_spin = QtWidgets.QSpinBox()
+            count_spin.setRange(1, 100000)
+            count_spin.setValue(int(step.get("count", 1)))
+            count_spin.setToolTip(
+                "How many times to jump back to the target step. The looped block "
+                "therefore runs (this count + 1) times in total."
+            )
+            count_spin.valueChanged.connect(
+                lambda v: self._update_control_step("count", int(v))
+            )
+            self.param_layout.addRow("Loop back to step #:", target_spin)
+            self.param_layout.addRow("Repeat (times to loop):", count_spin)
+
         else:
             info = QtWidgets.QLabel("Stop board: call StopBoard() when reaching this step.")
             self.param_layout.addRow(info)
@@ -3294,44 +3775,87 @@ class MainWindow(QtWidgets.QMainWindow):
             step[field] = value
         self._refresh_flow_row(row)
 
+    def _update_control_step(self, field: str, value):
+        """Update target/count on a 'Go to step' or 'Loop' step."""
+        row = self.flow_table.currentRow()
+        if row < 0 or row >= len(self.flow_steps):
+            return
+        step = self.flow_steps[row]
+        step[field] = int(value)
+        self._refresh_flow_row(row)
+
     def _execute_one_flow_step(self, step: dict) -> None:
         """Run one step dict on the connected board; raises on invalid config or hardware error."""
         if self._board is None:
             raise RuntimeError("Board not connected.")
         t = step.get("type")
+        if t in ("Go to step", "Loop"):
+            # Control-flow only; handled by the run loop, no hardware action.
+            return
         if t == "Move syringe":
             migrate_flow_step_inplace(step)
             pumps_cfg = step.get("pumps") or []
             if not pumps_cfg:
                 raise ValueError("No pumps configured for this step.")
-            moves = []
+            actions = []
             for j, pump in enumerate(pumps_cfg):
                 ref = str(pump.get("syringe", "") or "").strip()
                 if not ref:
                     raise ValueError(f"Syringe name is empty (pump {j + 1}).")
                 resolved = self._resolve_runtime_device("syringe", ref)
-                moves.append(
-                    (
-                        resolved["name"],
-                        float(pump.get("flowrate", 0.0)),
-                        float(pump.get("volume", 0.0)),
-                    )
+                mode = _normalize_pump_mode(pump.get("mode"))
+                actions.append(
+                    {
+                        "name": resolved["name"],
+                        "index": resolved.get("index"),
+                        "flowrate": float(pump.get("flowrate", 0.0)),
+                        "mode": mode,
+                        "direction": _normalize_pump_direction(pump.get("direction")),
+                        "amount": float(pump.get("volume", 0.0)),
+                        "setpoint": float(pump.get("setpoint", pump.get("volume", 0.0))),
+                    }
                 )
-            if len(moves) == 1:
-                self._board.Move(moves[0][0], moves[0][1], moves[0][2])
+            names = [a["name"] for a in actions]
+            if len(names) != len(set(names)):
+                raise ValueError(
+                    "Each parallel pump must use a different syringe "
+                    f"(got {names!r})."
+                )
+            if all(a["mode"] == "absolute" for a in actions):
+                moves = [(a["name"], a["flowrate"], a["setpoint"]) for a in actions]
+                if len(moves) == 1:
+                    self._board.Move(moves[0][0], moves[0][1], moves[0][2])
+                else:
+                    self._board.MoveParallel(moves)
             else:
-                names = [m[0] for m in moves]
-                if len(names) != len(set(names)):
-                    raise ValueError(
-                        "Each parallel pump must use a different syringe "
-                        f"(got {names!r})."
+                if len(actions) > 1:
+                    self._append_log(
+                        "Move syringe: mixed/relative pump modes are executed one after another; "
+                        "absolute-only steps can run with MoveParallel."
                     )
-                self._board.MoveParallel(moves)
+                for a in actions:
+                    idx_s = a["index"]
+                    if not isinstance(idx_s, int):
+                        idx_s = self._board.FindIndexS(a["name"])
+                    sdev = self._board.SPS01[idx_s]
+                    if a["mode"] == "absolute":
+                        sdev.MoveTo(a["flowrate"], a["setpoint"])
+                    else:
+                        sdev.MoveDirectional(
+                            a["flowrate"],
+                            a["amount"],
+                            a["direction"] == "push_out",
+                        )
 
         elif t == "Wait":
             sec = float(step.get("seconds", 0.0))
             if sec > 0:
-                interruptible_sleep(sec)
+                end = time.monotonic() + sec
+                while time.monotonic() < end:
+                    if self._run_cancelled():
+                        break
+                    QtWidgets.QApplication.processEvents()
+                    time.sleep(min(0.08, max(0.0, end - time.monotonic())))
         elif t == "Switch valves":
             name = step.get("manifold", "")
             if not name:
@@ -3530,7 +4054,11 @@ class MainWindow(QtWidgets.QMainWindow):
         ref_errors, ref_warnings = self._validate_device_refs(steps, label)
         errors.extend(ref_errors)
         warnings.extend(ref_warnings)
-        known_types = {"Move syringe", "Switch valves", "Wait", "Stop board"}
+        known_types = {
+            "Move syringe", "Switch valves", "Wait", "Stop board",
+            "Go to step", "Loop",
+        }
+        n_steps = len(steps)
         for i, step in enumerate(steps, start=1):
             t = step.get("type")
             tag = f"{label} {i} ({t})"
@@ -3547,11 +4075,19 @@ class MainWindow(QtWidgets.QMainWindow):
                         errors.append(
                             f"{tag}: pump {pj} flowrate must be > 0 (got {fr!r})."
                         )
-                    vol = pump.get("volume", 0)
-                    if not _is_valid_number(vol) or vol <= 0:
-                        errors.append(
-                            f"{tag}: pump {pj} volume must be > 0 (got {vol!r})."
-                        )
+                    mode = _normalize_pump_mode(pump.get("mode"))
+                    if mode == "absolute":
+                        sp = pump.get("setpoint", 0)
+                        if not _is_valid_number(sp) or sp < 0:
+                            errors.append(
+                                f"{tag}: pump {pj} set point must be >= 0 (got {sp!r})."
+                            )
+                    else:
+                        vol = pump.get("volume", 0)
+                        if not _is_valid_number(vol) or vol <= 0:
+                            errors.append(
+                                f"{tag}: pump {pj} amount must be > 0 (got {vol!r})."
+                            )
             elif t == "Switch valves":
                 # CmdSetValves codes: 0 No change · 1 Position A · 2 Closed · 3 Position B.
                 valid_codes = {code for _label, code in VALVE_POSITION_OPTIONS}
@@ -3567,6 +4103,20 @@ class MainWindow(QtWidgets.QMainWindow):
                 sec = step.get("seconds", 0)
                 if not _is_valid_number(sec) or sec <= 0:
                     errors.append(f"{tag}: seconds must be > 0 (got {sec!r}).")
+            elif t in ("Go to step", "Loop"):
+                target = step.get("target", 0)
+                if (isinstance(target, bool) or not isinstance(target, (int, float))
+                        or int(target) < 1 or int(target) > n_steps):
+                    errors.append(
+                        f"{tag}: target step must be between 1 and {n_steps} (got {target!r})."
+                    )
+                if t == "Loop":
+                    cnt = step.get("count", 0)
+                    if (isinstance(cnt, bool) or not isinstance(cnt, (int, float))
+                            or int(cnt) < 1):
+                        errors.append(
+                            f"{tag}: repeat count must be ≥ 1 (got {cnt!r})."
+                        )
             elif t == "Stop board":
                 pass
             else:
@@ -3660,7 +4210,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "Switch valves": ("manifold", "v1", "v2", "v3", "v4"),
             "Stop board": (),
         }
-        _known_types = set(_required) | {"Move syringe"}
+        _known_types = set(_required) | {"Move syringe", "Go to step", "Loop"}
         loaded = []
         for i, s in enumerate(steps):
             if not isinstance(s, dict) or s.get("type") not in _known_types:
@@ -3676,6 +4226,10 @@ class MainWindow(QtWidgets.QMainWindow):
                     )
                     continue
                 missing = []
+            elif stype in ("Go to step", "Loop"):
+                missing = ["target"] if "target" not in s else []
+                if stype == "Loop" and "count" not in s:
+                    missing.append("count")
             else:
                 missing = [k for k in _required[stype] if k not in s]
             if missing:
@@ -3729,13 +4283,50 @@ class MainWindow(QtWidgets.QMainWindow):
             self._set_flow_row_color(r, "transparent")
         self._prepare_board_for_run()
         self._begin_busy("Running flow…")
+        # Guard against a runaway Go-to/Loop configuration hanging the GUI.
+        max_exec = 100000
         try:
-            for idx, step in enumerate(self.flow_steps, start=1):
+            pc = 0
+            executed = 0
+            loop_remaining: dict[int, int] = {}
+            while 0 <= pc < n:
                 if self._run_cancelled():
                     break
-                row = idx - 1
+                executed += 1
+                if executed > max_exec:
+                    QtWidgets.QMessageBox.critical(
+                        self,
+                        "Execution error",
+                        f"Aborted after {max_exec} step executions — check the "
+                        "'Go to step' / 'Loop' targets for an infinite loop.",
+                    )
+                    break
+                step = self.flow_steps[pc]
+                row = pc
                 t = step.get("type")
-                self._set_busy_message(f"Flow {idx}/{n}: {t}…")
+
+                # Control-flow steps redirect the program counter instead of
+                # touching hardware.
+                if t == "Go to step":
+                    self._set_flow_row_color(row, "#9b59b6")
+                    QtWidgets.QApplication.processEvents()
+                    pc = int(step.get("target", 1)) - 1
+                    continue
+                if t == "Loop":
+                    self._set_flow_row_color(row, "#9b59b6")
+                    QtWidgets.QApplication.processEvents()
+                    target = int(step.get("target", 1))
+                    count = int(step.get("count", 1))
+                    remaining = loop_remaining.get(pc, count)
+                    if remaining > 0:
+                        loop_remaining[pc] = remaining - 1
+                        pc = target - 1
+                    else:
+                        loop_remaining.pop(pc, None)
+                        pc += 1
+                    continue
+
+                self._set_busy_message(f"Flow step {pc + 1}/{n}: {t}…")
                 self._set_flow_row_color(row, "#00a8e8")
                 QtWidgets.QApplication.processEvents()
                 try:
@@ -3752,10 +4343,11 @@ class MainWindow(QtWidgets.QMainWindow):
                     QtWidgets.QMessageBox.critical(
                         self,
                         "Execution error",
-                        f"Error executing step {idx} ({t}):\n{e}",
+                        f"Error executing step {pc + 1} ({t}):\n{e}",
                     )
                     break
                 QtWidgets.QApplication.processEvents()
+                pc += 1
         finally:
             self._end_busy()
             self._finalize_board_after_run()
@@ -4019,10 +4611,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.graph_add_btn = QtWidgets.QPushButton("Add node")
         self.graph_delete_node_btn = QtWidgets.QPushButton("Delete selected node")
         self.graph_delete_edge_btn = QtWidgets.QPushButton("Delete selected connection")
+        self.graph_set_loops_btn = QtWidgets.QPushButton("Set loops on selected…")
+        self.graph_set_loops_btn.setToolTip(
+            "Select a loop-back arrow (orange, below the chain), then change "
+            "how many times it repeats (0 = normal forward connection)."
+        )
         self.graph_clear_btn = QtWidgets.QPushButton("Clear all")
         left_layout.addWidget(self.graph_add_btn)
         left_layout.addWidget(self.graph_delete_node_btn)
         left_layout.addWidget(self.graph_delete_edge_btn)
+        left_layout.addWidget(self.graph_set_loops_btn)
         left_layout.addWidget(self.graph_clear_btn)
         left_layout.addStretch()
 
@@ -4033,8 +4631,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._graph_scene_mutating = False
         self.graph_view = FlowChartView(self.graph_scene)
         tip = QtWidgets.QLabel(
-            "Tip: Ctrl+wheel zoom. Drag out→in to wire. Single-chain only: one in / one out per node, "
-            "one start and one end; new wire replaces an old one on those ports. Run validates then executes."
+            "Tip: Ctrl+wheel zoom. Drag out→in to wire. For a loop, drag from a later node "
+            "back to an earlier one — you will be asked for loop count (orange arc below). "
+            "Forward chain: one in / one out per node; new wire replaces the old on those ports."
         )
         tip.setStyleSheet("color: palette(mid); font-size: 11px;")
         tip.setWordWrap(True)
@@ -4053,11 +4652,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.graph_load_btn = QtWidgets.QPushButton("Load graph")
         self.graph_run_btn = QtWidgets.QPushButton("Run graph")
         self.graph_run_btn.setObjectName("primaryButton")
+        self.graph_terminate_btn = QtWidgets.QPushButton("Terminate")
+        self.graph_terminate_btn.setToolTip("Cancel the currently running Flow Graph protocol.")
         ctrl_layout.addWidget(self.graph_fit_btn)
         ctrl_layout.addWidget(self.graph_save_btn)
         ctrl_layout.addWidget(self.graph_load_btn)
         ctrl_layout.addStretch()
         ctrl_layout.addWidget(self.graph_run_btn)
+        ctrl_layout.addWidget(self.graph_terminate_btn)
         center_layout.addLayout(ctrl_layout)
 
         # Right: module parameters — east column of this tab; fixed min width; stretch weight 2 vs center 4.
@@ -4098,6 +4700,11 @@ class MainWindow(QtWidgets.QMainWindow):
         right_outer.addWidget(self.graph_param_sidebar_hint)
         right_outer.addWidget(self.graph_param_scroll, 1)
         self.graph_param_scroll.setVisible(False)
+        right_outer.addWidget(QtWidgets.QLabel("Run log:"))
+        self.graph_log_edit = self._make_embedded_log_view(
+            "Flow Graph run messages appear here…"
+        )
+        right_outer.addWidget(self.graph_log_edit, 1)
 
         layout.addWidget(left_box, 1)
         layout.addWidget(center_box, 4)
@@ -4112,8 +4719,10 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self.graph_delete_node_btn.clicked.connect(self._on_graph_delete_node)
         self.graph_delete_edge_btn.clicked.connect(self._on_graph_delete_edge)
+        self.graph_set_loops_btn.clicked.connect(self._on_graph_set_loops)
         self.graph_clear_btn.clicked.connect(self._on_graph_clear)
         self.graph_run_btn.clicked.connect(self._on_graph_run)
+        self.graph_terminate_btn.clicked.connect(self._terminate_current_run)
         self.graph_fit_btn.clicked.connect(self._graph_fit_view)
         self.graph_save_btn.clicked.connect(self._on_save_graph)
         self.graph_load_btn.clicked.connect(self._on_load_graph)
@@ -4368,7 +4977,13 @@ class MainWindow(QtWidgets.QMainWindow):
         if node not in self.graph_nodes:
             return
         seen: set[int] = set()
-        for r in list(node.get("incoming", [])) + list(node.get("outgoing", [])):
+        touching = list(node.get("incoming", [])) + list(node.get("outgoing", []))
+        # Loop edges live outside the incoming/outgoing chain lists.
+        touching += [
+            rec for rec in self.graph_edges
+            if rec.get("loops", 0) >= 1 and (rec["src"] is node or rec["dst"] is node)
+        ]
+        for r in touching:
             rid = id(r)
             if rid in seen:
                 continue
@@ -4419,6 +5034,50 @@ class MainWindow(QtWidgets.QMainWindow):
                         self._graph_remove_edge_record(rec)
                         break
 
+    def _on_graph_set_loops(self):
+        """Set the loop-back repeat count on the selected connection arrow."""
+        rec = None
+        for item in self.graph_scene.selectedItems():
+            if isinstance(item, ArrowEdge):
+                for r in self.graph_edges:
+                    if r["item"] is item:
+                        rec = r
+                        break
+            if rec is not None:
+                break
+        if rec is None:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Set loops",
+                "Click a connection arrow on the canvas to select it, then set "
+                "its loop count.",
+            )
+            return
+        current = int(rec.get("loops", 0))
+        n, ok = QtWidgets.QInputDialog.getInt(
+            self, "Set loops",
+            "Number of times to loop back along this arrow\n"
+            "(0 = normal forward connection):",
+            current, 0, 100000, 1,
+        )
+        if not ok:
+            return
+        src_node, dst_node = rec["src"], rec["dst"]
+        new_loops = int(n)
+        was_loop = current >= 1
+        now_loop = new_loops >= 1
+        if was_loop == now_loop:
+            # Type unchanged — just update the count/style in place.
+            rec["loops"] = new_loops
+            rec["item"].set_loops(new_loops)
+        else:
+            # Switching between forward and loop changes chain accounting, so
+            # rebuild the edge cleanly.
+            self._graph_remove_edge_record(rec)
+            self._graph_create_edge(src_node, dst_node, loops=new_loops)
+        self._schedule_graph_edge_positions()
+        self._graph_update_scene_extent()
+
     def _on_graph_delete_node(self):
         selected_items = self.graph_scene.selectedItems()
         if not selected_items:
@@ -4466,10 +5125,6 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         if not path:
             return
-        _data_keys = {"type", "syringe", "flowrate", "volume", "seconds",
-                       "manifold", "v1", "v2", "v3", "v4",
-                       "pumps", "enable_second_syringe",
-                       "syringe_2", "flowrate_2", "volume_2"}
         node_id_map = {}
         nodes_out = []
         for i, n in enumerate(self.graph_nodes):
@@ -4477,7 +5132,7 @@ class MainWindow(QtWidgets.QMainWindow):
             node_id_map[id(n)] = nid
             entry = {"id": nid}
             for k, v in n.items():
-                if k in _data_keys:
+                if k in FLOW_STEP_DATA_KEYS:
                     entry[k] = v
             item = n.get("item")
             if item is not None:
@@ -4489,7 +5144,11 @@ class MainWindow(QtWidgets.QMainWindow):
             src_id = node_id_map.get(id(e["src"]))
             dst_id = node_id_map.get(id(e["dst"]))
             if src_id is not None and dst_id is not None:
-                edges_out.append({"src_id": src_id, "dst_id": dst_id})
+                edge_entry = {"src_id": src_id, "dst_id": dst_id}
+                loops = int(e.get("loops", 0))
+                if loops >= 1:
+                    edge_entry["loops"] = loops
+                edges_out.append(edge_entry)
         data = {"version": 1, "type": "flow_graph",
                 "nodes": nodes_out, "edges": edges_out}
         try:
@@ -4526,6 +5185,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 )
                 return
             data = steps_to_graph_data(steps)
+            warnings.extend(data.pop("warnings", []) or [])
             warnings.append("Imported a Flow Designer file and laid it out as a chain.")
         elif file_type != "flow_graph":
             QtWidgets.QMessageBox.warning(
@@ -4567,13 +5227,6 @@ class MainWindow(QtWidgets.QMainWindow):
             "Stop board": (),
         }
         _known_types_graph = set(_required) | {"Move syringe"}
-        _data_keys = {
-            "syringe", "flowrate", "volume", "seconds",
-            "manifold", "v1", "v2", "v3", "v4",
-            "pumps", "enable_second_syringe",
-            "syringe_1", "flowrate_1", "volume_1",
-            "syringe_2", "flowrate_2", "volume_2",
-        }
         self._on_graph_clear()
         id_to_node = {}
         for i, nd in enumerate(nodes_data):
@@ -4609,7 +5262,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 continue
             self._graph_add_node_from_type(ntype)
             node = self.graph_nodes[-1]
-            for k in _data_keys:
+            for k in FLOW_STEP_DATA_KEYS:
                 if k in nd:
                     node[k] = nd[k]
             migrate_flow_step_inplace(node)
@@ -4630,7 +5283,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 if src is None or dst is None:
                     warnings.append(f"Edge {j}: skipped (references unknown node)")
                     continue
-                self._graph_create_edge(src, dst)
+                loops_raw = ed.get("loops", 0)
+                try:
+                    loops = max(0, int(loops_raw))
+                except (TypeError, ValueError):
+                    loops = 0
+                self._graph_create_edge(src, dst, loops=loops)
         self._schedule_graph_edge_positions()
         self._graph_update_scene_extent()
         QtCore.QTimer.singleShot(0, self._graph_fit_view)
@@ -4676,19 +5334,41 @@ class MainWindow(QtWidgets.QMainWindow):
         exec_order = self._get_graph_execution_order()
 
         n = len(exec_order)
+        # Map loop (back-jump) edges onto positions in the forward chain.
+        pos_of = {id(node): i for i, node in enumerate(exec_order)}
+        loop_jumps: dict[int, tuple] = {}
+        for rec in self.graph_edges:
+            if rec.get("loops", 0) >= 1:
+                s, d = rec["src"], rec["dst"]
+                if id(s) in pos_of and id(d) in pos_of:
+                    loop_jumps[id(s)] = (pos_of[id(d)], int(rec["loops"]))
         for node in self.graph_nodes:
             it = node.get("item")
             if it is not None:
                 it.setPen(QtGui.QPen(ACCENT, 2))
         self._prepare_board_for_run()
         self._begin_busy("Running graph…")
+        max_exec = 100000
         try:
-            for idx, step in enumerate(exec_order, start=1):
+            pc = 0
+            executed = 0
+            loop_remaining: dict[int, int] = {}
+            while 0 <= pc < n:
                 if self._run_cancelled():
                     break
+                executed += 1
+                if executed > max_exec:
+                    QtWidgets.QMessageBox.critical(
+                        self,
+                        "Execution error",
+                        f"Aborted after {max_exec} node executions — check loop "
+                        "connections for an infinite loop.",
+                    )
+                    break
+                step = exec_order[pc]
                 t = step.get("type")
                 item = step.get("item")
-                self._set_busy_message(f"Graph {idx}/{n}: {t}…")
+                self._set_busy_message(f"Graph step {pc + 1}/{n}: {t}…")
                 if item is not None:
                     item.setPen(QtGui.QPen(QtGui.QColor("#00a8e8"), 2))
                 QtWidgets.QApplication.processEvents()
@@ -4707,10 +5387,22 @@ class MainWindow(QtWidgets.QMainWindow):
                     QtWidgets.QMessageBox.critical(
                         self,
                         "Execution error",
-                        f"Error executing node {idx} ({t}):\n{e}",
+                        f"Error executing node {pc + 1} ({t}):\n{e}",
                     )
                     break
                 QtWidgets.QApplication.processEvents()
+
+                # After running the node, follow a loop edge if one starts here.
+                nid = id(step)
+                if nid in loop_jumps:
+                    dst_pos, loops = loop_jumps[nid]
+                    remaining = loop_remaining.get(nid, loops)
+                    if remaining > 0:
+                        loop_remaining[nid] = remaining - 1
+                        pc = dst_pos
+                        continue
+                    loop_remaining.pop(nid, None)
+                pc += 1
         finally:
             self._end_busy()
             self._finalize_board_after_run()
@@ -4803,10 +5495,47 @@ class StepParamDialog(QtWidgets.QDialog):
                             combo.setEditText(cur)
                     fe = QtWidgets.QLineEdit(str(pump.get("flowrate", 100.0)))
                     ve = QtWidgets.QLineEdit(str(pump.get("volume", 10.0)))
+                    se = QtWidgets.QLineEdit(str(pump.get("setpoint", pump.get("volume", 0.0))))
+                    mode_combo = QtWidgets.QComboBox()
+                    mode_combo.addItem("Flow + Amount", "relative")
+                    mode_combo.addItem("Set point", "absolute")
+                    mode_combo.setCurrentIndex(
+                        1 if _normalize_pump_mode(pump.get("mode")) == "absolute" else 0
+                    )
+                    direction_combo = QtWidgets.QComboBox()
+                    direction_combo.addItem("Push out (dispense)", "push_out")
+                    direction_combo.addItem("Pull in (aspirate)", "pull_in")
+                    direction_combo.setCurrentIndex(
+                        1 if _normalize_pump_direction(pump.get("direction")) == "pull_in" else 0
+                    )
+                    direction_label = QtWidgets.QLabel(f"Direction {idx + 1}:")
+                    amount_label = QtWidgets.QLabel(f"Amount {idx + 1} (µL):")
+                    setpoint_label = QtWidgets.QLabel(f"Set point {idx + 1} (µL):")
+
+                    def sync_mode_visibility(
+                        combo_mode=mode_combo,
+                        dlab=direction_label,
+                        dfield=direction_combo,
+                        alab=amount_label,
+                        afield=ve,
+                        slab=setpoint_label,
+                        sfield=se,
+                    ):
+                        absolute = combo_mode.currentData() == "absolute"
+                        for w in (dlab, dfield, alab, afield):
+                            w.setVisible(not absolute)
+                        for w in (slab, sfield):
+                            w.setVisible(absolute)
+
+                    mode_combo.currentIndexChanged.connect(lambda _idx, fn=sync_mode_visibility: fn())
                     msp_form.addRow(f"Syringe {idx + 1}:", combo)
+                    msp_form.addRow(f"Move mode {idx + 1}:", mode_combo)
                     msp_form.addRow(f"Flowrate {idx + 1} (µL/min):", fe)
-                    msp_form.addRow(f"Volume {idx + 1} (µL):", ve)
-                    msp_state["rows"].append((combo, fe, ve))
+                    msp_form.addRow(direction_label, direction_combo)
+                    msp_form.addRow(amount_label, ve)
+                    msp_form.addRow(setpoint_label, se)
+                    sync_mode_visibility()
+                    msp_state["rows"].append((combo, mode_combo, direction_combo, fe, ve, se))
 
             self._msp_collect_rows = lambda: msp_state["rows"]
             rebuild_msp_rows()
@@ -4842,6 +5571,22 @@ class StepParamDialog(QtWidgets.QDialog):
             layout.addRow("V3:", self.v3_combo)
             layout.addRow("V4:", self.v4_combo)
 
+        elif t == "Go to step":
+            self.target_spin = QtWidgets.QSpinBox()
+            self.target_spin.setRange(1, 100000)
+            self.target_spin.setValue(int(step.get("target", 1)))
+            layout.addRow("Go to step #:", self.target_spin)
+
+        elif t == "Loop":
+            self.target_spin = QtWidgets.QSpinBox()
+            self.target_spin.setRange(1, 100000)
+            self.target_spin.setValue(int(step.get("target", 1)))
+            self.count_spin = QtWidgets.QSpinBox()
+            self.count_spin.setRange(1, 100000)
+            self.count_spin.setValue(int(step.get("count", 1)))
+            layout.addRow("Loop back to step #:", self.target_spin)
+            layout.addRow("Repeat (times to loop):", self.count_spin)
+
         else:
             info = QtWidgets.QLabel("Stop board: no parameters.")
             layout.addRow(info)
@@ -4861,12 +5606,15 @@ class StepParamDialog(QtWidgets.QDialog):
                 migrate_flow_step_inplace(self._step)
                 rows = getattr(self, "_msp_collect_rows", lambda: [])()
                 pumps_out = []
-                for combo, fe, ve in rows:
+                for combo, mode_combo, direction_combo, fe, ve, se in rows:
                     pumps_out.append(
                         {
                             "syringe": combo.currentText().strip(),
                             "flowrate": float(fe.text().strip()),
                             "volume": float(ve.text().strip()),
+                            "mode": str(mode_combo.currentData()),
+                            "direction": str(direction_combo.currentData()),
+                            "setpoint": float(se.text().strip()),
                         }
                     )
                 self._step["pumps"] = pumps_out[
@@ -4881,6 +5629,11 @@ class StepParamDialog(QtWidgets.QDialog):
                 self._step["v2"] = int(self.v2_combo.currentData())
                 self._step["v3"] = int(self.v3_combo.currentData())
                 self._step["v4"] = int(self.v4_combo.currentData())
+            elif t == "Go to step":
+                self._step["target"] = int(self.target_spin.value())
+            elif t == "Loop":
+                self._step["target"] = int(self.target_spin.value())
+                self._step["count"] = int(self.count_spin.value())
         except ValueError:
             QtWidgets.QMessageBox.warning(
                 self, "Input error", "Please enter valid numeric values."
